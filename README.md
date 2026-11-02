@@ -9,18 +9,18 @@ with array-valued output schema types can load. Release archives retain the
 upstream `mcp-proxy` executable name.
 
 Releases include SHA-256 checksums signed with keyless Cosign and GitHub
-build-provenance attestations for each archive. For v1.1.1, download your archive,
+build-provenance attestations for each archive. For v1.1.2, download your archive,
 `checksums.txt`, and `checksums.txt.sigstore.json` from
-<https://github.com/dkarter/mcp-proxy/releases/tag/v1.1.1>, then verify:
+<https://github.com/dkarter/mcp-proxy/releases/tag/v1.1.2>, then verify:
 
 ```sh
 cosign verify-blob \
-  --certificate-identity 'https://github.com/dkarter/mcp-proxy/.github/workflows/goreleaser.yml@refs/tags/v1.1.1' \
+  --certificate-identity 'https://github.com/dkarter/mcp-proxy/.github/workflows/goreleaser.yml@refs/tags/v1.1.2' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
   --bundle checksums.txt.sigstore.json checksums.txt
 
 # Replace the archive name with the one you downloaded.
-gh attestation verify mcp-proxy_1.1.1_darwin_arm64.tar.gz --repo dkarter/mcp-proxy
+gh attestation verify mcp-proxy_1.1.2_darwin_arm64.tar.gz --repo dkarter/mcp-proxy
 
 # Check the archive against the verified checksum file (GNU coreutils).
 sha256sum --check --ignore-missing checksums.txt
