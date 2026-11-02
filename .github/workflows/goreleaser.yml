@@ -33,6 +33,8 @@ jobs:
         run: go vet ./...
       - name: Install Cosign
         run: go install github.com/sigstore/cosign/v3/cmd/cosign@v3.1.4
+        env:
+          GOTOOLCHAIN: auto
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v7.3.0 # Verified immutable release tag.
         with:
