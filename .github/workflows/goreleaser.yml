@@ -1,32 +1,54 @@
-name: Goreleaser
+name: GoReleaser
 
 on:
   push:
     tags:
-      - "*"
+      - "v*"
+
+permissions:
+  contents: read
 
 jobs:
   goreleaser:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
-      -
-        name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      -
-        name: Set up Go
-        uses: actions/setup-go@v5
-      -
-        name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v6
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@v7.0.0 # Verified immutable release tag.
         with:
-          # either 'goreleaser' (default) or 'goreleaser-pro'
+          go-version-file: go.mod
+      - name: Test
+        run: go test -race ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Install Cosign
+        run: go install github.com/sigstore/cosign/v3/cmd/cosign@v3.1.4
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v7.3.0 # Verified immutable release tag.
+        with:
           distribution: goreleaser
-          # 'latest', 'nightly', or a semver
-          version: '~> v2'
+          version: v2.19.0
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Your GoReleaser Pro key, if you are using the 'goreleaser-pro' distribution
-          # GORELEASER_KEY: ${{ secrets.GORELEASER_KEY }}
+      - name: Attest release archives
+        uses: actions/attest@v4.2.2 # Verified immutable release tag.
+        with:
+          subject-checksums: ./dist/checksums.txt
+      - name: Verify signature and publish release
+        run: |
+          cosign verify-blob \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/goreleaser.yml@${GITHUB_REF}" \
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+            --bundle dist/checksums.txt.sigstore.json dist/checksums.txt
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

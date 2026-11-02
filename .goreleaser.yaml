@@ -1,4 +1,17 @@
 version: 2
+release:
+  draft: true
+checksum:
+  name_template: checksums.txt
+signs:
+  - cmd: cosign
+    signature: "${artifact}.sigstore.json"
+    args:
+      - sign-blob
+      - "--bundle=${signature}"
+      - "${artifact}"
+      - --yes
+    artifacts: checksum
 builds:
   - id: mcp-proxy
     main: .

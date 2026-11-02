@@ -547,6 +547,59 @@ func TestCatalogRegistrationPreservesInputSchemaPropertyOrder(t *testing.T) {
 	}
 }
 
+// GitHub MCP 2.x returns nullable output schemas with an array-valued type.
+// The proxy must mount the catalog and preserve that schema for its callers.
+func TestCatalogRegistrationPreservesArrayValuedOutputSchemaType(t *testing.T) {
+	t.Parallel()
+
+	downstream := newRawDownstream(t)
+	downstream.setRawTools(`[{"name":"get_me","inputSchema":{"type":"object"},"outputSchema":{"type":["object","null"],"properties":{"login":{"type":"string"}}}}]`)
+	mcpClient, err := newMCPClient("test", &MCPClientConfigV2{
+		TransportType: MCPClientTypeStreamable,
+		URL:           downstream.url,
+		Options:       &OptionsV2{},
+	})
+	if err != nil {
+		t.Fatalf("newMCPClient: %v", err)
+	}
+	defer func() { _ = mcpClient.Close() }()
+
+	proxyServer := newProxyServerForTest(t)
+	if err := mcpClient.addToMCPServer(t.Context(), mcp.Implementation{Name: "test"}, proxyServer); err != nil {
+		t.Fatalf("addToMCPServer: %v", err)
+	}
+	response := proxyServer.HandleMessage(t.Context(), []byte(`{
+		"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}
+	}`))
+	raw, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("marshal tools/list: %v", err)
+	}
+	var decoded struct {
+		Result struct {
+			Tools []struct {
+				Name         string `json:"name"`
+				OutputSchema struct {
+					Type       []string `json:"type"`
+					Properties map[string]struct {
+						Type string `json:"type"`
+					} `json:"properties"`
+				} `json:"outputSchema"`
+			} `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("decode tools/list: %v", err)
+	}
+	if len(decoded.Result.Tools) != 1 {
+		t.Fatalf("expected one tool, got %s", raw)
+	}
+	tool := decoded.Result.Tools[0]
+	if tool.Name != "get_me" || !slices.Equal(tool.OutputSchema.Type, []string{"object", "null"}) || tool.OutputSchema.Properties["login"].Type != "string" {
+		t.Fatalf("output schema changed: %s", raw)
+	}
+}
+
 // Regression for the listing half of connect being unbounded: a downstream that
 // completes initialize and then never answers tools/list would otherwise wedge
 // the startup goroutine (and the retry loop) forever. catalogTimeout must turn

@@ -168,6 +168,7 @@ func TestDoctorUpdatesAuthStatusAfterTokenRefresh(t *testing.T) {
 	}
 	writeTestToken(t, "refreshable", &transport.Token{
 		AccessToken: "expired", RefreshToken: "refresh", ExpiresAt: time.Now().Add(-time.Hour),
+		Issuer: remote.URL,
 	})
 	res := checkServerAuth("refreshable", conf)
 	if res.ok || !strings.HasPrefix(res.status, "EXPIRED") {
