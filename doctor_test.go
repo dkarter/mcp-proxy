@@ -166,9 +166,9 @@ func TestDoctorUpdatesAuthStatusAfterTokenRefresh(t *testing.T) {
 		URL:           remote.URL + "/mcp",
 		OAuth:         &OAuthClientConfig{ClientID: "test", AuthServerMetadataURL: remote.URL + "/metadata"},
 	}
+	// mcp-go only refreshes a token bound to the authorization server's issuer.
 	writeTestToken(t, "refreshable", &transport.Token{
-		AccessToken: "expired", RefreshToken: "refresh", ExpiresAt: time.Now().Add(-time.Hour),
-		Issuer: remote.URL,
+		Issuer: remote.URL, AccessToken: "expired", RefreshToken: "refresh", ExpiresAt: time.Now().Add(-time.Hour),
 	})
 	res := checkServerAuth("refreshable", conf)
 	if res.ok || !strings.HasPrefix(res.status, "EXPIRED") {
@@ -184,5 +184,38 @@ func TestDoctorUpdatesAuthStatusAfterTokenRefresh(t *testing.T) {
 	checkServerLive(&res, conf)
 	if res.ok || !strings.HasPrefix(res.live, "FAILED:") {
 		t.Fatalf("expected failed live check, got %+v", res)
+	}
+}
+
+// An empty access token is not usable, and the local diagnostic must
+// not report it as healthy (the daemon's getValidToken would refuse it).
+func TestCheckOAuthTokenRejectsEmptyAccessToken(t *testing.T) {
+	isolateUserConfigDir(t)
+	const refreshOnly = "reviewfix-refresh-only"
+	const emptyAccess = "reviewfix-empty-access"
+	const valid = "reviewfix-valid"
+
+	conf := &MCPClientConfigV2{URL: "https://mcp.example.com/mcp", OAuth: &OAuthClientConfig{}}
+
+	writeTestToken(t, refreshOnly, &transport.Token{RefreshToken: "r"})
+	res := checkServerAuth(refreshOnly, conf)
+	if res.ok {
+		t.Errorf("a token with no access token must not be reported ok, got %+v", res)
+	}
+	if !strings.Contains(res.status, "MISSING ACCESS TOKEN") {
+		t.Errorf("status should explain the missing access token, got %q", res.status)
+	}
+
+	writeTestToken(t, emptyAccess, &transport.Token{AccessToken: "", ExpiresAt: time.Now().Add(time.Hour)})
+	res = checkServerAuth(emptyAccess, conf)
+	if res.ok {
+		t.Errorf("a token with an empty access token must not be reported ok, got %+v", res)
+	}
+
+	// Control: a real unexpired token is still ok.
+	writeTestToken(t, valid, &transport.Token{AccessToken: "a", ExpiresAt: time.Now().Add(time.Hour)})
+	res = checkServerAuth(valid, conf)
+	if !res.ok {
+		t.Errorf("an unexpired token with an access token should be ok, got %+v", res)
 	}
 }

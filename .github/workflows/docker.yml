@@ -10,13 +10,14 @@ on:
 
 jobs:
   build-and-push:
+    timeout-minutes: 30
     permissions:
         packages: write
         contents: read
     runs-on: ubuntu-latest
     steps:
       - name: Build and push Docker image
-        uses: TBXark/docker-action@master
+        uses: TBXark/docker-action@0f436866f96a7edf5ee581edca2365288ef002c6
         with:
           version: ${{ github.event.inputs.version || 'latest' }}
           docker_registry: ghcr.io

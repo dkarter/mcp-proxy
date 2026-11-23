@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -40,7 +41,7 @@ const bearerPrefix = "Bearer "
 
 // bearerToken extracts the credentials from an Authorization header. RFC 7235
 // makes the scheme name case-insensitive, so "bearer" is as valid as "Bearer".
-// A bare token with no scheme is also accepted, which earlier versions allowed.
+// A bare token with no scheme is also accepted.
 func bearerToken(header string) string {
 	header = strings.TrimSpace(header)
 	if len(header) >= len(bearerPrefix) && strings.EqualFold(header[:len(bearerPrefix)], bearerPrefix) {
@@ -75,6 +76,61 @@ func newAuthMiddleware(tokens []string) MiddlewareFunc {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// hostGuardMiddleware is the DNS-rebinding protection for the MCP routes,
+// replacing the loopback-only guard mcp-go ships (disabled in newMCPServer)
+// with one that also accepts the public host the proxy serves under.
+//
+// The guard only applies when the connection arrived on a loopback interface -
+// a request that came in over a public interface already proves the client
+// reached the right address. On loopback the Host header's hostname must be a
+// loopback name itself (localhost, 127.0.0.0/8, ::1) or match allowedHost, the
+// hostname of mcpProxy.baseURL, so a same-host reverse proxy can forward its
+// public Host to a loopback listener.
+func hostGuardMiddleware(allowedHost string) MiddlewareFunc {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			localAddr, _ := r.Context().Value(http.LocalAddrContextKey).(net.Addr)
+			if localAddr == nil || !isLoopbackAddr(localAddr) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			host := r.Host
+			if h, _, err := net.SplitHostPort(host); err == nil {
+				host = h
+			}
+			host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
+			if isLoopbackHostname(host) || strings.EqualFold(host, allowedHost) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			http.Error(w, "Forbidden: invalid Host header", http.StatusForbidden)
+		})
+	}
+}
+
+// isLoopbackAddr reports whether addr names a loopback interface.
+func isLoopbackAddr(addr net.Addr) bool {
+	if tcp, ok := addr.(*net.TCPAddr); ok {
+		return tcp.IP.IsLoopback()
+	}
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// isLoopbackHostname reports whether host is a loopback name: "localhost", an
+// address in 127.0.0.0/8, or ::1.
+func isLoopbackHostname(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func loggerMiddleware(prefix string) MiddlewareFunc {
@@ -171,29 +227,23 @@ type readinessReport struct {
 	unhealthy []string
 }
 
-// fatalStartupError applies the panicIfInvalid half of the per-server failure
-// policy: it returns err when that server asked for a fast, fatal failure, and
-// nil otherwise. It deliberately does not log, because the caller knows whether
-// the failure is terminal (log an error) or about to be retried (log nothing;
-// the retry line carries the detail). Logging here unconditionally would emit
-// an ERROR for every retry attempt of a backend that is simply not up yet.
+// startupFailed reports a downstream that could not be started and will not be
+// retried, so the rest of the proxy still serves. It is only for terminal
+// failures: an attempt about to be retried logs its WARN retry line instead
+// (an unreachable backend is not an error), and logging both would emit an
+// ERROR for every retry of a backend that is simply not up yet.
 //
-// The returned error is redacted, because it is propagated out of the startup
-// errorGroup and logged by main: a transport error embeds the downstream URL,
-// which may carry a credential in its query.
-func fatalStartupError(clientConfig *MCPClientConfigV2, err error) error {
+// The error is redacted before it is logged or returned: it is propagated out
+// of the startup errorGroup and logged by main, and a transport error embeds
+// the downstream URL, which may carry a credential in its query. The returned
+// error is non-nil when panicIfInvalid makes the failure fatal for the whole
+// process.
+func startupFailed(name string, clientConfig *MCPClientConfigV2, err error) error {
+	slog.Error("Failed to start client", "client", name, "err", redactURLCredentials(err))
 	if clientConfig.Options.panicIfInvalid() {
 		return redactURLCredentials(err)
 	}
 	return nil
-}
-
-// clientStartupError reports a downstream that could not be started and will
-// not be retried, so the rest of the proxy still serves. It returns err when
-// panicIfInvalid makes the failure fatal for the whole process.
-func clientStartupError(name string, clientConfig *MCPClientConfigV2, err error) error {
-	slog.Error("Failed to start client", "client", name, "err", redactURLCredentials(err))
-	return fatalStartupError(clientConfig, err)
 }
 
 // permanentStartupError reports whether retrying cannot help: a downstream that
@@ -222,6 +272,9 @@ func retryWait(ctx context.Context, interval time.Duration) bool {
 	}
 }
 
+// readHeaderTimeout is how long a client may take to send request headers.
+const readHeaderTimeout = 30 * time.Second
+
 func startHTTPServer(config *Config) error {
 	baseURL, uErr := url.Parse(config.McpProxy.BaseURL)
 	if uErr != nil {
@@ -229,6 +282,10 @@ func startHTTPServer(config *Config) error {
 		// redact anyway since the parse error embeds the URL.
 		return redactURLCredentials(uErr)
 	}
+	// The host DNS-rebinding protection accepts, besides loopback Host values:
+	// the public hostname the proxy is published under, so a reverse proxy can
+	// forward it to a loopback listener.
+	allowedHost := baseURL.Hostname()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -238,9 +295,15 @@ func startHTTPServer(config *Config) error {
 	httpServer := &http.Server{
 		Addr:    config.McpProxy.Addr,
 		Handler: httpMux,
+		// Bounds only the request headers, so a client that opens connections
+		// and trickles headers (slowloris) cannot pin goroutines and sockets.
+		// Read/WriteTimeout stay unset: SSE and streamable-HTTP responses are
+		// long-lived streams.
+		ReadHeaderTimeout: readHeaderTimeout,
 	}
 	info := mcp.Implementation{
-		Name: config.McpProxy.Name,
+		Name:    config.McpProxy.Name,
+		Version: config.McpProxy.Version,
 	}
 	// clients is filled in from the per-server goroutines below.
 	var clientsMu sync.Mutex
@@ -287,12 +350,13 @@ func startHTTPServer(config *Config) error {
 		// runs exactly once per server; a backend that was down at startup and
 		// connects later is mounted then, by the retry below.
 		var mountOnce sync.Once
-		mountRoute := func(mcpClient *Client, server *Server) {
+		mountRoute := func(server *Server) {
 			mountOnce.Do(func() {
 				// Outermost first: recover also guards the middlewares below it,
 				// and the logger records requests that auth rejects.
 				middlewares := make([]MiddlewareFunc, 0)
 				middlewares = append(middlewares, recoverMiddleware(name))
+				middlewares = append(middlewares, hostGuardMiddleware(allowedHost))
 				if clientConfig.Options.logEnabled() {
 					middlewares = append(middlewares, loggerMiddleware(name))
 				}
@@ -308,12 +372,6 @@ func startHTTPServer(config *Config) error {
 				}
 				slog.Info("Handling requests", "client", name, "route", mcpRoute)
 				httpMux.Handle(mcpRoute, chainMiddleware(server.handler, middlewares...))
-				httpServer.RegisterOnShutdown(func() {
-					slog.Info("Shutting down", "client", name)
-					if cErr := mcpClient.Close(); cErr != nil {
-						slog.Error("Failed to close client", "client", name, "err", cErr)
-					}
-				})
 			})
 		}
 
@@ -322,10 +380,16 @@ func startHTTPServer(config *Config) error {
 			autoReconnect := clientConfig.Options.autoReconnect()
 			interval := clientConfig.Options.reconnectInterval()
 
-			var (
-				mcpClient *Client
-				server    *Server
-			)
+			// Build the server first: it depends only on the config, so it is
+			// never retried - and building it before the client means a
+			// construction failure cannot leave a stdio subprocess (spawned by
+			// newMCPClient) running until shutdown.
+			server, sErr := newMCPServer(name, config.McpProxy, clientConfig)
+			if sErr != nil {
+				return startupFailed(name, clientConfig, sErr)
+			}
+
+			var mcpClient *Client
 			for {
 				// Creating a stdio client already spawns the subprocess, so a
 				// missing command fails here rather than while connecting. Both
@@ -333,16 +397,8 @@ func startHTTPServer(config *Config) error {
 				if mcpClient == nil {
 					created, err := newMCPClient(name, clientConfig)
 					if err != nil {
-						// Terminal unless it will be retried: log an error for a
-						// failure that ends the attempt, and stay quiet on the
-						// retry path (an unreachable backend is not an error).
-						if fatal := fatalStartupError(clientConfig, err); fatal != nil {
-							slog.Error("Failed to start client", "client", name, "err", redactURLCredentials(err))
-							return fatal
-						}
-						if !autoReconnect {
-							slog.Error("Failed to start client", "client", name, "err", redactURLCredentials(err))
-							return nil
+						if !autoReconnect || clientConfig.Options.panicIfInvalid() {
+							return startupFailed(name, clientConfig, err)
 						}
 						slog.Warn("Retrying client creation", "client", name, "err", redactURLCredentials(err), "retryIn", interval)
 						if !retryWait(ctx, interval) {
@@ -365,33 +421,23 @@ func startHTTPServer(config *Config) error {
 					}
 					clients[name] = mcpClient
 					clientsMu.Unlock()
-
-					newServer, sErr := newMCPServer(name, config.McpProxy, clientConfig)
-					if sErr != nil {
-						// A malformed server definition will not fix itself, so
-						// it is never retried.
-						return clientStartupError(name, clientConfig, sErr)
-					}
-					server = newServer
 				}
 
 				err := mcpClient.addToMCPServer(ctx, info, server.mcpServer)
 				if err == nil {
 					slog.Info("Connected", "client", name)
-					mountRoute(mcpClient, server)
+					mountRoute(server)
 					return nil
 				}
-				if fatal := fatalStartupError(clientConfig, err); fatal != nil {
-					slog.Error("Failed to start client", "client", name, "err", redactURLCredentials(err))
-					return fatal
+				if clientConfig.Options.panicIfInvalid() {
+					return startupFailed(name, clientConfig, err)
 				}
 				if mcpClient.closed.Load() {
 					// Shutdown already closed this client; not a startup error.
 					return nil
 				}
 				if !autoReconnect {
-					slog.Error("Failed to start client", "client", name, "err", redactURLCredentials(err))
-					return nil
+					return startupFailed(name, clientConfig, err)
 				}
 				if permanentStartupError(err) {
 					// Retrying cannot help - interactive OAuth is needed. Report

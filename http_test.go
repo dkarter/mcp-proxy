@@ -1,14 +1,17 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
 	"github.com/mark3labs/mcp-go/client/transport"
+	"github.com/tbxark/optional-go"
 )
 
 // The recover middleware is listed first so it wraps the others: a panic in
@@ -49,6 +52,49 @@ func TestChainMiddlewareRecoversFromPanicInLaterMiddleware(t *testing.T) {
 	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
 	if recorder.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusInternalServerError)
+	}
+}
+
+// The host guard only looks at loopback connections: there the Host hostname
+// must itself be loopback or equal the public host from mcpProxy.baseURL.
+func TestHostGuardMiddleware(t *testing.T) {
+	t.Parallel()
+
+	handler := hostGuardMiddleware("mcp.example.com")(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+
+	loopback := &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9090}
+	public := &net.TCPAddr{IP: net.ParseIP("10.0.0.5"), Port: 9090}
+
+	tests := []struct {
+		name      string
+		localAddr net.Addr
+		host      string
+		want      int
+	}{
+		{name: "localhost with port", localAddr: loopback, host: "localhost:9090", want: http.StatusNoContent},
+		{name: "loopback IP", localAddr: loopback, host: "127.0.0.1", want: http.StatusNoContent},
+		{name: "loopback IPv6", localAddr: loopback, host: "[::1]:9090", want: http.StatusNoContent},
+		{name: "allowed public host", localAddr: loopback, host: "mcp.example.com", want: http.StatusNoContent},
+		{name: "allowed host case and port", localAddr: loopback, host: "MCP.EXAMPLE.COM:443", want: http.StatusNoContent},
+		{name: "foreign host on loopback", localAddr: loopback, host: "evil.com", want: http.StatusForbidden},
+		{name: "foreign host off loopback", localAddr: public, host: "evil.com", want: http.StatusNoContent},
+		{name: "no local addr", localAddr: nil, host: "evil.com", want: http.StatusNoContent},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/mcp/", nil)
+			request.Host = tt.host
+			if tt.localAddr != nil {
+				ctx := context.WithValue(request.Context(), http.LocalAddrContextKey, tt.localAddr)
+				request = request.WithContext(ctx)
+			}
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, request)
+			if recorder.Code != tt.want {
+				t.Errorf("Host %q from %v -> %d, want %d", tt.host, tt.localAddr, recorder.Code, tt.want)
+			}
+		})
 	}
 }
 
@@ -202,5 +248,31 @@ func TestPermanentStartupErrorClassification(t *testing.T) {
 				t.Errorf("permanentStartupError(%v) = %v, want %v", tt.err, got, tt.want)
 			}
 		})
+	}
+}
+
+// The fatal startup path returns the transport error out of the startup
+// errorGroup, where main logs it. It must be redacted there too.
+func TestFatalStartupErrorIsRedacted(t *testing.T) {
+	t.Parallel()
+
+	urlErr := &url.Error{Op: "Post", URL: "https://mcp.example.com/mcp?key=FATAL_SECRET", Err: errors.New("refused")}
+
+	panicIfInvalid := optional.NewField(true)
+
+	fatal := startupFailed("test", &MCPClientConfigV2{Options: &OptionsV2{PanicIfInvalid: panicIfInvalid}}, urlErr)
+	if fatal == nil {
+		t.Fatal("panicIfInvalid should make the failure fatal")
+	}
+	if strings.Contains(fatal.Error(), "FATAL_SECRET") {
+		t.Fatalf("the fatal startup error still carries the credential: %s", fatal)
+	}
+	if _, ok := errors.AsType[*url.Error](fatal); !ok {
+		t.Error("redaction must preserve the url.Error in the chain")
+	}
+
+	// Without panicIfInvalid the failure is not fatal at all.
+	if got := startupFailed("test", &MCPClientConfigV2{Options: &OptionsV2{}}, urlErr); got != nil {
+		t.Errorf("a non-fatal startup error should return nil, got %v", got)
 	}
 }

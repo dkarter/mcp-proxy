@@ -36,12 +36,8 @@ func buildOAuthConfig(serverName string, conf *OAuthClientConfig) (transport.OAu
 	if err != nil {
 		return transport.OAuthConfig{}, err
 	}
-	redirectURI := conf.RedirectURI
-	if redirectURI == "" {
-		redirectURI = defaultOAuthRedirectURI
-	}
 	clientID, clientSecret := conf.ClientID, conf.ClientSecret
-	if clientID == "" {
+	if clientID == "" && !conf.ignoreSavedClient {
 		regClientID, regClientSecret, ok, rErr := loadRegisteredClient(serverName)
 		if rErr != nil {
 			return transport.OAuthConfig{}, rErr
@@ -53,9 +49,9 @@ func buildOAuthConfig(serverName string, conf *OAuthClientConfig) (transport.OAu
 	return transport.OAuthConfig{
 		ClientID:              clientID,
 		ClientSecret:          clientSecret,
-		RedirectURI:           redirectURI,
+		RedirectURI:           oauthRedirectURI(conf),
 		Scopes:                conf.Scopes,
-		TokenStore:            NewFileTokenStore(tokenPath),
+		TokenStore:            earlyRefreshTokenStore{NewFileTokenStore(tokenPath)},
 		PKCEEnabled:           !conf.PKCEDisabled,
 		AuthServerMetadataURL: conf.AuthServerMetadataURL,
 	}, nil
@@ -66,7 +62,9 @@ func buildOAuthConfig(serverName string, conf *OAuthClientConfig) (transport.OAu
 // a browser to the provider's consent screen, waits for the local redirect
 // callback, exchanges the code for a token, and persists it via the same
 // FileTokenStore the daemon reads from. Intended to be run by hand, in a
-// real desktop session with a browser - never by the unattended daemon.
+// real desktop session with a browser - never by the unattended daemon. On
+// a machine without a browser the URL it logs can be opened on another
+// device, provided the callback reaches this process (oauth.callbackListen).
 func runAuthorize(configPath, serverName string, insecure, expandEnv bool, httpHeaders string, httpTimeout int) error {
 	config, err := load(configPath, insecure, expandEnv, httpHeaders, httpTimeout)
 	if err != nil {
@@ -82,7 +80,6 @@ func runAuthorize(configPath, serverName string, insecure, expandEnv bool, httpH
 	}
 
 	var oauthConf *OAuthClientConfig
-	var mcpClient *client.Client
 	switch v := clientInfo.(type) {
 	case *StdioMCPClientConfig:
 		return fmt.Errorf("server %q is a stdio server, OAuth authorization does not apply", serverName)
@@ -91,39 +88,32 @@ func runAuthorize(configPath, serverName string, insecure, expandEnv bool, httpH
 			return fmt.Errorf("server %q has no oauth config; add mcpServers.%s.oauth to config.json first", serverName, serverName)
 		}
 		oauthConf = v.OAuth
-		oc, bErr := buildOAuthConfig(serverName, oauthConf)
-		if bErr != nil {
-			return bErr
-		}
-		mcpClient, err = client.NewOAuthSSEClient(v.URL, oc, sseClientOptions(v)...)
 	case *StreamableMCPClientConfig:
 		if v.OAuth == nil {
 			return fmt.Errorf("server %q has no oauth config; add mcpServers.%s.oauth to config.json first", serverName, serverName)
 		}
 		oauthConf = v.OAuth
-		oc, bErr := buildOAuthConfig(serverName, oauthConf)
-		if bErr != nil {
-			return bErr
-		}
-		mcpClient, err = client.NewOAuthStreamableHttpClient(v.URL, oc, streamableClientOptions(v)...)
 	default:
 		return errors.New("invalid client type")
 	}
+	// Decided before the client is built: a saved client that has to be
+	// replaced must not lend its credentials to the registration of the new
+	// one.
+	oauthConf.ignoreSavedClient, err = savedClientNeedsReplacing(serverName, oauthConf)
+	if err != nil {
+		return err
+	}
+	mcpClient, err := newRawClient(serverName, clientInfo)
 	if err != nil {
 		return fmt.Errorf("failed to create client: %w", err)
 	}
 	defer func() { _ = mcpClient.Close() }()
 
-	redirectURI := oauthConf.RedirectURI
-	if redirectURI == "" {
-		redirectURI = defaultOAuthRedirectURI
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
 	if err := mcpClient.Start(ctx); err != nil {
-		if authErr := authorizeInteractively(ctx, err, serverName, redirectURI); authErr != nil {
+		if authErr := authorizeInteractively(ctx, err, serverName, oauthConf); authErr != nil {
 			return authErr
 		}
 		if err := mcpClient.Start(ctx); err != nil {
@@ -135,7 +125,7 @@ func runAuthorize(configPath, serverName string, insecure, expandEnv bool, httpH
 	initRequest.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
 	initRequest.Params.ClientInfo = mcp.Implementation{Name: "mcp-proxy-authorize", Version: BuildVersion}
 	if _, err := mcpClient.Initialize(ctx, initRequest); err != nil {
-		if authErr := authorizeInteractively(ctx, err, serverName, redirectURI); authErr != nil {
+		if authErr := authorizeInteractively(ctx, err, serverName, oauthConf); authErr != nil {
 			return authErr
 		}
 		if _, err := mcpClient.Initialize(ctx, initRequest); err != nil {
@@ -150,15 +140,21 @@ func runAuthorize(configPath, serverName string, insecure, expandEnv bool, httpH
 // authorizeInteractively runs the browser + local-callback OAuth dance if
 // err indicates authorization is required; otherwise it returns err (redacted,
 // since a transport error embeds the downstream URL) as-is.
-func authorizeInteractively(ctx context.Context, err error, serverName, redirectURI string) error {
+func authorizeInteractively(ctx context.Context, err error, serverName string, conf *OAuthClientConfig) error {
 	if !client.IsOAuthAuthorizationRequiredError(err) {
 		return redactURLCredentials(err)
 	}
 	oauthHandler := client.GetOAuthHandler(err)
 
-	callbackPath, addr, pErr := parseRedirectURI(redirectURI)
+	redirectURI := oauthRedirectURI(conf)
+	callbackPath, addr, pErr := parseRedirectURI(redirectURI, conf.CallbackListen != "")
 	if pErr != nil {
 		return pErr
+	}
+	if conf.CallbackListen != "" {
+		if addr, pErr = parseCallbackListen(conf.CallbackListen); pErr != nil {
+			return pErr
+		}
 	}
 
 	codeVerifier, err := client.GenerateCodeVerifier()
@@ -179,13 +175,9 @@ func authorizeInteractively(ctx context.Context, err error, serverName, redirect
 	}
 	defer func() { _ = srv.Close() }()
 
-	if oauthHandler.GetClientID() == "" {
-		if err := oauthHandler.RegisterClient(ctx, "mcp-proxy ("+serverName+")"); err != nil {
-			return fmt.Errorf("failed to register OAuth client: %w", err)
-		}
-		if err := saveRegisteredClient(serverName, oauthHandler.GetClientID(), oauthHandler.GetClientSecret()); err != nil {
-			return fmt.Errorf("failed to persist registered OAuth client: %w", err)
-		}
+	saveOnApproval, err := ensureRegisteredClient(ctx, oauthHandler, serverName, redirectURI, conf.ignoreSavedClient)
+	if err != nil {
+		return err
 	}
 
 	authURL, err := oauthHandler.GetAuthorizationURL(ctx, state, codeChallenge)
@@ -196,7 +188,7 @@ func authorizeInteractively(ctx context.Context, err error, serverName, redirect
 	slog.Info("Opening browser for authorization", "server", serverName, "url", authURL)
 	openBrowser(authURL)
 
-	slog.Info("Waiting for authorization callback", "server", serverName, "redirect_uri", redirectURI)
+	slog.Info("Waiting for authorization callback", "server", serverName, "redirect_uri", redirectURI, "listen", srv.Addr)
 	select {
 	case params := <-callbackChan:
 		if errMsg := params["error"]; errMsg != "" {
@@ -212,10 +204,69 @@ func authorizeInteractively(ctx context.Context, err error, serverName, redirect
 		if err := oauthHandler.ProcessAuthorizationResponse(ctx, code, state, codeVerifier); err != nil {
 			return fmt.Errorf("failed to exchange authorization code: %w", err)
 		}
+		// A client that replaces a saved one is saved only once its token
+		// has been issued: until then the saved client and its token stay
+		// as they were, for the daemon to keep using, and a failed exchange
+		// cannot leave the old token paired with the new client.
+		if saveOnApproval {
+			if err := saveRegisteredClient(serverName, oauthHandler.GetClientID(), oauthHandler.GetClientSecret(), redirectURI); err != nil {
+				return fmt.Errorf("failed to persist registered OAuth client: %w", err)
+			}
+		}
 		return nil
 	case <-ctx.Done():
 		return fmt.Errorf("timed out waiting for authorization callback: %w", ctx.Err())
 	}
+}
+
+// oauthRedirectURI returns the redirect URI of an oauth block, or the default.
+func oauthRedirectURI(conf *OAuthClientConfig) string {
+	if conf.RedirectURI == "" {
+		return defaultOAuthRedirectURI
+	}
+	return conf.RedirectURI
+}
+
+// savedClientNeedsReplacing reports whether -authorize has to register a new
+// dynamic client instead of using the saved one. A client is registered for
+// one redirect URI: for any other the provider refuses the authorization
+// request, in the browser where -authorize cannot see it. So a saved client
+// is only used when it was registered for the configured redirect URI, which
+// rules out one saved before the redirect URI was recorded. A clientId from
+// the config is the operator's own registration and is never replaced.
+func savedClientNeedsReplacing(serverName string, conf *OAuthClientConfig) (bool, error) {
+	if conf.ClientID != "" {
+		return false, nil
+	}
+	saved, ok, err := readRegisteredClient(serverName)
+	if err != nil || !ok {
+		return false, err
+	}
+	return saved.RedirectURI != oauthRedirectURI(conf), nil
+}
+
+// ensureRegisteredClient registers a dynamic client when the handler has no
+// client ID. A first registration is saved at once. One that replaces a saved
+// client is not: saveOnApproval tells the caller to save it once the sign-in
+// has been approved and its token issued.
+func ensureRegisteredClient(ctx context.Context, oauthHandler *transport.OAuthHandler, serverName, redirectURI string, replacing bool) (saveOnApproval bool, err error) {
+	if oauthHandler.GetClientID() != "" {
+		return false, nil
+	}
+	if replacing {
+		slog.Info("Registering a new OAuth client: the saved one was not registered for this redirect URI",
+			"server", serverName, "redirect_uri", redirectURI)
+	}
+	if err := oauthHandler.RegisterClient(ctx, "mcp-proxy ("+serverName+")"); err != nil {
+		return false, fmt.Errorf("failed to register OAuth client: %w", err)
+	}
+	if replacing {
+		return true, nil
+	}
+	if err := saveRegisteredClient(serverName, oauthHandler.GetClientID(), oauthHandler.GetClientSecret(), redirectURI); err != nil {
+		return false, fmt.Errorf("failed to persist registered OAuth client: %w", err)
+	}
+	return false, nil
 }
 
 // oauthAwareError rewrites an OAuthAuthorizationRequiredError into a message
@@ -228,7 +279,13 @@ func oauthAwareError(serverName string, err error) error {
 	return err
 }
 
-func parseRedirectURI(redirectURI string) (path string, addr string, err error) {
+// parseRedirectURI returns the callback path of the redirect URI and its
+// host:port. By default the callback listener binds to that host:port, so the
+// URI has to be an http loopback URL with an explicit port. With behindProxy
+// (oauth.callbackListen is set) the listener binds elsewhere and the URI is
+// only where the provider sends the browser: https on any host is allowed as
+// well, and the port is optional.
+func parseRedirectURI(redirectURI string, behindProxy bool) (path string, addr string, err error) {
 	// Echo a redacted form: this error is printed and logged, and the URI could
 	// carry a credential in its userinfo or query. A URL that does not parse is
 	// replaced entirely, since its raw text cannot be redacted reliably.
@@ -237,8 +294,12 @@ func parseRedirectURI(redirectURI string) (path string, addr string, err error) 
 	if err != nil {
 		return "", "", fmt.Errorf("invalid redirect URI %q", display)
 	}
-	if u.Scheme != "http" {
-		return "", "", fmt.Errorf("redirect URI %q must use http", display)
+	schemes := "http"
+	if behindProxy {
+		schemes = "http or https"
+	}
+	if u.Scheme != "http" && (u.Scheme != "https" || !behindProxy) {
+		return "", "", fmt.Errorf("redirect URI %q must use %s", display, schemes)
 	}
 	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return "", "", fmt.Errorf("redirect URI %q cannot contain user info, query, or fragment", display)
@@ -248,21 +309,46 @@ func parseRedirectURI(redirectURI string) (path string, addr string, err error) 
 		return "", "", fmt.Errorf("redirect URI %q must include a host", display)
 	}
 	ip := net.ParseIP(hostname)
-	if !strings.EqualFold(hostname, "localhost") && (ip == nil || !ip.IsLoopback()) {
+	if u.Scheme == "http" && !strings.EqualFold(hostname, "localhost") && (ip == nil || !ip.IsLoopback()) {
+		if behindProxy {
+			// The authorization code travels to this URL, so off loopback
+			// it has to be encrypted.
+			return "", "", fmt.Errorf("redirect URI %q must use https unless its host is localhost or a loopback IP", display)
+		}
 		return "", "", fmt.Errorf("redirect URI %q must use localhost or a loopback IP", display)
 	}
 	port := u.Port()
-	if port == "" {
+	if port == "" && !behindProxy {
 		return "", "", fmt.Errorf("redirect URI %q must include an explicit port", display)
 	}
-	portNumber, err := strconv.Atoi(port)
-	if err != nil || portNumber < 1 || portNumber > 65535 {
-		return "", "", fmt.Errorf("redirect URI %q contains an invalid port", display)
+	if port != "" {
+		portNumber, err := strconv.Atoi(port)
+		if err != nil || portNumber < 1 || portNumber > 65535 {
+			return "", "", fmt.Errorf("redirect URI %q contains an invalid port", display)
+		}
 	}
 	if u.Path == "" || u.Path == "/" {
 		return "", "", fmt.Errorf("redirect URI %q must include a callback path", display)
 	}
 	return u.Path, net.JoinHostPort(hostname, port), nil
+}
+
+// parseCallbackListen validates oauth.callbackListen and returns the address
+// the callback listener binds to. Like the default address it has to be
+// loopback: the listener never binds to a public interface.
+func parseCallbackListen(callbackListen string) (addr string, err error) {
+	host, port, err := net.SplitHostPort(callbackListen)
+	if err != nil {
+		return "", errors.New("callback listen address must be host:port")
+	}
+	if !isLoopbackHostname(host) {
+		return "", errors.New("callback listen address must use localhost or a loopback IP")
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return "", errors.New("callback listen address contains an invalid port")
+	}
+	return net.JoinHostPort(host, strconv.Itoa(portNumber)), nil
 }
 
 func startOAuthCallbackServer(addr, callbackPath, expectedState string, callbackChan chan<- map[string]string) (*http.Server, error) {

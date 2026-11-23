@@ -9,7 +9,12 @@
 -http-timeout int      timeout (seconds) for remote config fetch (default 10)
 -insecure              skip TLS verification for remote config
 -authorize string      run a one-time interactive OAuth authorization for the
-                        named mcpServers entry, then exit
+                        named mcpServers entry, then exit (opens a browser)
+-auth-status           list every configured server with its transport and auth
+                        state, then exit (local-only, no network calls)
+-doctor                like -auth-status, but also connects to each remote
+                        server to confirm credentials are accepted right now
+                        (may refresh an expired OAuth token; never opens a browser)
 -check-config          load and validate the config, then exit
 -log-level value       log level: debug, info, warn, or error (default info)
 -version               print version and exit
@@ -37,6 +42,12 @@ Given `mcpProxy.baseURL = https://mcp.example.com` and a server key `fetch`:
 - For `type: sse`: `https://mcp.example.com/fetch/sse`
 - For `type: streamable-http`: `https://mcp.example.com/fetch/mcp`
 
+When a downstream announces that its tools, prompts, or resources changed, the
+proxy re-lists them and the new catalog is served live — see the note in
+[CONFIGURATION.md](CONFIGURATION.md#mcpservers) for the cases where
+notifications cannot arrive. Progress/logging notifications and
+server-initiated sampling, elicitation, and roots requests are not forwarded.
+
 ## Health checks
 
 Two unauthenticated endpoints are always served for liveness/readiness probes
@@ -45,9 +56,12 @@ Two unauthenticated endpoints are always served for liveness/readiness probes
 - `/_healthz` (liveness) returns `200` as soon as the process serves requests. It
   is about this process only, so it stays `200` even when a downstream is down.
 - `/_readyz` (readiness) returns `503` with `"status":"initializing"` until every
-  enabled server has finished connecting and mounting its route, then `200`.
+  enabled server has finished connecting and mounting its route — or until
+  `mcpProxy.startupGracePeriod` elapses, so one slow downstream cannot keep the
+  proxy out of rotation — then `200`.
 - `/_readyz` returns `503` again with `"status":"degraded"` if a downstream that
-  had connected later stops answering: each connection is probed every 30s, and
+  had connected later stops answering: each connection is probed every
+  `pingInterval` (default 30s), and
   the servers that failed are listed in `unhealthy`. It takes three failed probes
   in a row, so a busy single-threaded server that misses one probe does not take
   the proxy out of rotation. Servers speaking the modern protocol (2026-07-28,
@@ -101,7 +115,7 @@ Authorization: Bearer <token>
 Authorization: <token>
 ```
 
-If your client cannot set headers, embed the token in the route key (e.g. `fetch/<token>`) and call that path instead.
+If your client cannot set headers, embed the token in the route key (e.g. `fetch/<token>`) and call that path instead. Be aware that the token then becomes part of the server name: it appears in every log line for that server, in the startup route log, and in the unauthenticated `/_readyz` `unhealthy` list. Only use this when the port and the proxy's logs are private.
 
 ## OAuth-authorizing a downstream server
 
@@ -125,3 +139,25 @@ running when you authorized, restart it now - the new token won't be
 picked up otherwise. After that, tokens refresh automatically as they
 expire with no further restarts needed. Re-run `-authorize` only if the
 server reports the token is no longer valid (e.g. access was revoked).
+
+### Authorizing on a machine without a browser
+
+By default the provider redirects the browser to `http://localhost:8090/oauth/callback`,
+so the browser has to run on the same machine as `-authorize`. On a headless
+server, either forward that port over SSH (`ssh -L 8090:localhost:8090 <server>`)
+and open the logged URL locally, or let a reverse proxy on the server receive
+the callback:
+
+```jsonc
+"oauth": {
+  "redirectUri": "https://gateway.example.net/oauth/callback",
+  "callbackListen": "127.0.0.1:8090"
+}
+```
+
+`redirectUri` is what the provider sends the browser to. The reverse proxy
+(nginx, Caddy, ...) serves it and forwards `/oauth/callback`, with the path
+unchanged, to `callbackListen`, where the listener only exists while
+`-authorize` runs. Run `-authorize` on the server, open the URL it logs in a
+browser on any device that can reach `redirectUri`, and approve. With a static
+`clientId`, register the same `redirectUri` with the provider.

@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -71,9 +72,9 @@ func (d *downstreamRecorder) values(key string) []string {
 	return seen
 }
 
-// newDownstreamHandler builds the minimal echo MCP server these tests proxy to,
-// returning the handler and the route suffix its transport expects.
-func newDownstreamHandler(transportType string) (http.Handler, string) {
+// newEchoMCPServer builds the minimal downstream these tests proxy to. The
+// returned server can be mutated mid-run (e.g. AddTool to emit list_changed).
+func newEchoMCPServer() *server.MCPServer {
 	mcpServer := server.NewMCPServer("downstream", "1.0.0", server.WithToolCapabilities(true))
 	mcpServer.AddTool(
 		mcp.NewTool("echo", mcp.WithString("message", mcp.Required())),
@@ -85,7 +86,13 @@ func newDownstreamHandler(transportType string) (http.Handler, string) {
 			return mcp.NewToolResultText("downstream:" + message), nil
 		},
 	)
+	return mcpServer
+}
 
+// newDownstreamHandler builds the minimal echo MCP server these tests proxy to,
+// returning the handler and the route suffix its transport expects.
+func newDownstreamHandler(transportType string) (http.Handler, string) {
+	mcpServer := newEchoMCPServer()
 	if transportType == "sse" {
 		return server.NewSSEServer(mcpServer), "/sse"
 	}
@@ -100,6 +107,15 @@ func startDownstreamOnAddr(t *testing.T, addr, transportType string) *httptest.S
 	t.Helper()
 
 	handler, _ := newDownstreamHandler(transportType)
+	return serveOnAddr(t, addr, handler)
+}
+
+// serveOnAddr runs handler on a fixed address, retrying the bind briefly and
+// dropping client connections before Close so a subscription stream the proxy
+// holds open cannot hang the teardown.
+func serveOnAddr(t *testing.T, addr string, handler http.Handler) *httptest.Server {
+	t.Helper()
+
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		listener, err := net.Listen("tcp", addr)
@@ -107,7 +123,13 @@ func startDownstreamOnAddr(t *testing.T, addr, transportType string) *httptest.S
 			downstream := httptest.NewUnstartedServer(handler)
 			downstream.Listener = listener
 			downstream.Start()
-			t.Cleanup(downstream.Close)
+			// CloseClientConnections drops the proxy's subscriptions/listen
+			// stream, which otherwise stays open until the proxy dies and
+			// would hang Close (the downstream teardown can run first).
+			t.Cleanup(func() {
+				downstream.CloseClientConnections()
+				downstream.Close()
+			})
 			return downstream
 		}
 		if time.Now().After(deadline) {
@@ -176,6 +198,112 @@ func TestRemoteServerTransports(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// A caller on protocol version 2026-07-28 puts its connection state in each
+// request's _meta. The proxy's own connection to a downstream can be on an
+// older version, and a strict downstream rejects a body envelope that names a
+// different version from its MCP-Protocol-Version header. mcp-go's streamable
+// HTTP server is strict, so restricting it to the legacy versions reproduces
+// what hosted servers such as Linear do.
+func TestModernCallerThroughLegacyDownstream(t *testing.T) {
+	skipShort(t)
+	t.Parallel()
+
+	var (
+		mu       sync.Mutex
+		seenMeta []*mcp.Meta
+	)
+	mcpServer := server.NewMCPServer("downstream", "1.0.0",
+		server.WithToolCapabilities(true),
+		server.WithPromptCapabilities(true),
+		server.WithResourceCapabilities(false, false),
+	)
+	record := func(meta *mcp.Meta) {
+		mu.Lock()
+		defer mu.Unlock()
+		seenMeta = append(seenMeta, meta)
+	}
+	mcpServer.AddTool(
+		mcp.NewTool("echo", mcp.WithString("message", mcp.Required())),
+		func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			record(request.Params.Meta)
+			return mcp.NewToolResultText("downstream:" + request.GetString("message", "")), nil
+		},
+	)
+	mcpServer.AddPrompt(mcp.NewPrompt("greeting"),
+		func(ctx context.Context, request mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+			record(request.Params.Meta)
+			return mcp.NewGetPromptResult("greeting", []mcp.PromptMessage{
+				mcp.NewPromptMessage(mcp.RoleUser, mcp.NewTextContent("hello")),
+			}), nil
+		},
+	)
+	mcpServer.AddResource(mcp.NewResource("test://note", "note"),
+		func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+			record(request.Params.Meta)
+			return []mcp.ResourceContents{mcp.TextResourceContents{URI: "test://note", Text: "note"}}, nil
+		},
+	)
+	handler := server.NewStreamableHTTPServer(mcpServer,
+		server.WithStreamableHTTPProtocolVersions(mcp.LegacyProtocolVersions()...))
+	recorder := &downstreamRecorder{}
+	downstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recorder.record(r.Header)
+		handler.ServeHTTP(w, r)
+	}))
+	t.Cleanup(downstream.Close)
+
+	configPath, addr := remoteConfig(t, "streamable-http", downstream.URL+"/mcp")
+	proxy := startProxy(t, configPath, addr)
+	mcpClient := proxy.connect(t, "streamable-http", "remote")
+	if got := mcpClient.ProtocolVersion(); got != mcp.ProtocolVersion20260728 {
+		t.Fatalf("caller negotiated %q with the proxy, want %q", got, mcp.ProtocolVersion20260728)
+	}
+	// The proxy probed server/discover on 2026-07-28 while connecting, so only
+	// the requests from here on show which version the connection settled on.
+	connectRequests := len(recorder.values(mcp.HeaderProtocolVersion))
+
+	ctx := testContext(t)
+	if result, err := callTool(t, mcpClient, "echo", map[string]any{"message": "hi"}); err != nil {
+		t.Errorf("call tool through a legacy downstream: %v", err)
+	} else if got := resultText(t, result); got != "downstream:hi" {
+		t.Errorf("echo through a legacy downstream = %q, want %q", got, "downstream:hi")
+	}
+	promptRequest := mcp.GetPromptRequest{}
+	promptRequest.Params.Name = "greeting"
+	if _, err := mcpClient.GetPrompt(ctx, promptRequest); err != nil {
+		t.Errorf("get prompt through a legacy downstream: %v", err)
+	}
+	resourceRequest := mcp.ReadResourceRequest{}
+	resourceRequest.Params.URI = "test://note"
+	if _, err := mcpClient.ReadResource(ctx, resourceRequest); err != nil {
+		t.Errorf("read resource through a legacy downstream: %v", err)
+	}
+
+	versions := recorder.values(mcp.HeaderProtocolVersion)
+	if len(versions) <= connectRequests {
+		t.Fatal("the downstream received no requests from the calls")
+	}
+	for _, version := range versions[connectRequests:] {
+		if version == "" || mcp.IsModernProtocol(version) {
+			t.Fatalf("proxy called the downstream with protocol version %q, want a legacy connection", version)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seenMeta) != 3 {
+		t.Fatalf("downstream handled %d requests, want 3", len(seenMeta))
+	}
+	for _, meta := range seenMeta {
+		if version := meta.ProtocolVersion(); version != "" {
+			t.Errorf("downstream saw the caller's protocol version %q in _meta", version)
+		}
+		if info := meta.ClientInfo(); info != nil {
+			t.Errorf("downstream saw the caller's clientInfo %#v in _meta", info)
+		}
 	}
 }
 
@@ -537,5 +665,126 @@ func TestAutoReconnectStopsOnPermanentAuthError(t *testing.T) {
 	}
 	if !strings.Contains(logs, "mcp-proxy -authorize") {
 		t.Errorf("the failure did not carry the actionable authorize hint\n%s", logs)
+	}
+}
+
+// A stateful streamable-http downstream loses its session when it restarts:
+// the rebuilt server does not know the session id it handed out before. The
+// forwarded call must trigger the session-loss recovery (with autoReconnect)
+// and come back with a result, not a permanent transport error.
+func TestStatefulDownstreamRestartKeepsRoute(t *testing.T) {
+	skipShort(t)
+	t.Parallel()
+
+	downstreamAddr := freeAddr(t)
+	downstreamURL := "http://" + downstreamAddr + "/mcp"
+	configPath, addr := autoReconnectConfig(t, downstreamURL,
+		`{"autoReconnect": true, "reconnectInterval": "100ms"}`)
+
+	stateful := func() *httptest.Server {
+		return serveOnAddr(t, downstreamAddr,
+			server.NewStreamableHTTPServer(newEchoMCPServer()))
+	}
+	downstream := stateful()
+	proxy := startProxy(t, configPath, addr)
+
+	mcpClient := proxy.connect(t, "streamable-http", "remote")
+	if got := callToolText(t, mcpClient, "echo", map[string]any{"message": "before"}); got != "downstream:before" {
+		t.Fatalf("echo before the restart = %q, want %q", got, "downstream:before")
+	}
+
+	// Restart on the same address: the new server instance has never seen the
+	// session id the proxy's client still presents.
+	downstream.CloseClientConnections()
+	downstream.Close()
+	downstream = stateful()
+	defer downstream.Close()
+
+	ctx := testContext(t)
+	request := mcp.CallToolRequest{}
+	request.Params.Name = "echo"
+	request.Params.Arguments = map[string]any{"message": "after"}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		result, err := mcpClient.CallTool(ctx, request)
+		if err == nil && !result.IsError {
+			if got := resultText(t, result); got == "downstream:after" {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("calls through a restarted session did not recover within 10s: %v\n%s",
+				err, proxy.stderr.String())
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// A downstream that gains a tool mid-run announces tools/list_changed, and the
+// proxy must re-list and re-publish it. SSE downstreams push the notification
+// on their event stream; a modern streamable-http downstream delivers it on
+// the subscriptions/listen stream the proxy opted in to.
+func TestDownstreamListChangedRefreshesCatalog(t *testing.T) {
+	skipShort(t)
+	t.Parallel()
+
+	for _, transportType := range []string{"sse", "streamable-http"} {
+		t.Run(transportType, func(t *testing.T) {
+			t.Parallel()
+
+			mcpServer := newEchoMCPServer()
+			var downstream *httptest.Server
+			var downstreamURL string
+			if transportType == "sse" {
+				downstream = httptest.NewServer(server.NewSSEServer(mcpServer))
+				downstreamURL = downstream.URL + "/sse"
+			} else {
+				downstream = httptest.NewServer(server.NewStreamableHTTPServer(mcpServer))
+				downstreamURL = downstream.URL + "/mcp"
+			}
+			t.Cleanup(func() {
+				downstream.CloseClientConnections()
+				downstream.Close()
+			})
+
+			configPath, addr := remoteConfig(t, transportType, downstreamURL)
+			proxy := startProxy(t, configPath, addr)
+			mcpClient := proxy.connect(t, "streamable-http", "remote")
+
+			toolNames := func() []string {
+				listed, err := mcpClient.ListTools(testContext(t), mcp.ListToolsRequest{})
+				if err != nil {
+					t.Fatalf("list tools through the proxy: %v", err)
+				}
+				names := make([]string, 0, len(listed.Tools))
+				for _, tool := range listed.Tools {
+					names = append(names, tool.Name)
+				}
+				slices.Sort(names)
+				return names
+			}
+			if got := toolNames(); !slices.Equal(got, []string{"echo"}) {
+				t.Fatalf("tools before the change = %v, want [echo]", got)
+			}
+
+			mcpServer.AddTool(
+				mcp.NewTool("added"),
+				func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+					return mcp.NewToolResultText("new"), nil
+				},
+			)
+
+			deadline := time.Now().Add(10 * time.Second)
+			for {
+				if got := toolNames(); slices.Equal(got, []string{"added", "echo"}) {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("the added tool did not reach the proxy catalog within 10s\n%s",
+						proxy.stderr.String())
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
+		})
 	}
 }

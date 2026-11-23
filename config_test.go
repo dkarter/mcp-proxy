@@ -39,7 +39,8 @@ func TestParseMCPClientConfigV2(t *testing.T) {
 		want    any
 	}{
 		{name: "infer stdio", config: &MCPClientConfigV2{Command: "server"}, want: &StdioMCPClientConfig{}},
-		{name: "infer sse", config: &MCPClientConfigV2{URL: "https://example.com/sse"}, want: &SSEMCPClientConfig{}},
+		{name: "infer streamable", config: &MCPClientConfigV2{URL: "https://example.com/mcp"}, want: &StreamableMCPClientConfig{}},
+		{name: "explicit sse", config: &MCPClientConfigV2{TransportType: MCPClientTypeSSE, URL: "https://example.com/sse"}, want: &SSEMCPClientConfig{}},
 		{name: "explicit streamable", config: &MCPClientConfigV2{TransportType: MCPClientTypeStreamable, URL: "https://example.com/mcp"}, want: &StreamableMCPClientConfig{}},
 		{name: "null", config: nil, wantErr: "server config is null"},
 		{name: "ambiguous", config: &MCPClientConfigV2{Command: "server", URL: "https://example.com"}, wantErr: "mutually exclusive"},
@@ -48,11 +49,8 @@ func TestParseMCPClientConfigV2(t *testing.T) {
 		{name: "stdio missing command", config: &MCPClientConfigV2{TransportType: MCPClientTypeStdio}, wantErr: "command is required"},
 		{name: "oauth on stdio", config: &MCPClientConfigV2{Command: "server", OAuth: &OAuthClientConfig{}}, wantErr: "oauth is not supported"},
 		{name: "negative timeout", config: &MCPClientConfigV2{TransportType: MCPClientTypeStreamable, URL: "https://example.com", Timeout: -1}, wantErr: "timeout cannot be negative"},
-		// A stray sub-millisecond timeout copied in from a Claude config (where
-		// a bare number means nanoseconds) is discarded rather than failing the
-		// whole proxy's startup. A usable one is kept and bounds each request.
-		{name: "stdio ignores unusable timeout", config: &MCPClientConfigV2{Command: "server", Timeout: 30}, want: &StdioMCPClientConfig{}},
-		{name: "stdio keeps usable timeout", config: &MCPClientConfigV2{Command: "server", Timeout: Duration(30 * time.Second)}, want: &StdioMCPClientConfig{Timeout: Duration(30 * time.Second)}},
+		{name: "negative stdio timeout", config: &MCPClientConfigV2{Command: "server", Timeout: -1}, wantErr: "timeout cannot be negative"},
+		{name: "stdio keeps timeout", config: &MCPClientConfigV2{Command: "server", Timeout: Duration(30 * time.Second)}, want: &StdioMCPClientConfig{Timeout: Duration(30 * time.Second)}},
 	}
 
 	for _, tt := range tests {
@@ -98,6 +96,18 @@ func TestValidateConfig(t *testing.T) {
 		}
 	})
 
+	t.Run("public OAuth redirect with callbackListen", func(t *testing.T) {
+		config := validTestConfig()
+		config.McpServers["remote"] = &MCPClientConfigV2{
+			URL:     "https://example.com/mcp",
+			OAuth:   &OAuthClientConfig{RedirectURI: "https://gateway.example.net/oauth/callback", CallbackListen: "127.0.0.1:8090"},
+			Options: &OptionsV2{},
+		}
+		if err := validateConfig(config); err != nil {
+			t.Fatalf("validate config: %v", err)
+		}
+	})
+
 	tests := []struct {
 		name    string
 		mutate  func(*Config)
@@ -107,8 +117,14 @@ func TestValidateConfig(t *testing.T) {
 		{name: "unknown proxy type", mutate: func(c *Config) { c.McpProxy.Type = "websocket" }, wantErr: "mcpProxy.type"},
 		{name: "empty token", mutate: func(c *Config) { c.McpServers["stdio"].Options.AuthTokens = []string{""} }, wantErr: "authTokens[0]"},
 		{name: "unknown filter mode", mutate: func(c *Config) {
-			c.McpServers["stdio"].Options.ToolFilter = &ToolFilterConfig{Mode: "permit", List: []string{"tool"}}
+			c.McpServers["stdio"].Options.ToolFilter = &FilterConfig{Mode: "permit", List: []string{"tool"}}
 		}, wantErr: "toolFilter.mode"},
+		{name: "empty allow list", mutate: func(c *Config) {
+			c.McpServers["stdio"].Options.ToolFilter = &FilterConfig{Mode: FilterModeAllow}
+		}, wantErr: "toolFilter.list cannot be empty in allow mode"},
+		{name: "proxy-level disabled", mutate: func(c *Config) {
+			c.McpProxy.Options = &OptionsV2{Disabled: true}
+		}, wantErr: "disabled is only valid per server"},
 		{name: "invalid remote URL", mutate: func(c *Config) {
 			c.McpServers["stdio"] = &MCPClientConfigV2{URL: "://bad", Options: &OptionsV2{}}
 		}, wantErr: "is invalid"},
@@ -119,6 +135,27 @@ func TestValidateConfig(t *testing.T) {
 				Options: &OptionsV2{},
 			}
 		}, wantErr: "loopback"},
+		{name: "public OAuth redirect without callbackListen", mutate: func(c *Config) {
+			c.McpServers["stdio"] = &MCPClientConfigV2{
+				URL:     "https://example.com/mcp",
+				OAuth:   &OAuthClientConfig{RedirectURI: "https://gateway.example.net/oauth/callback"},
+				Options: &OptionsV2{},
+			}
+		}, wantErr: `.oauth.redirectUri: redirect URI "https://gateway.example.net/oauth/callback" must use http`},
+		{name: "callbackListen without redirectUri", mutate: func(c *Config) {
+			c.McpServers["stdio"] = &MCPClientConfigV2{
+				URL:     "https://example.com/mcp",
+				OAuth:   &OAuthClientConfig{CallbackListen: "127.0.0.1:8090"},
+				Options: &OptionsV2{},
+			}
+		}, wantErr: "callbackListen requires redirectUri"},
+		{name: "public callbackListen", mutate: func(c *Config) {
+			c.McpServers["stdio"] = &MCPClientConfigV2{
+				URL:     "https://example.com/mcp",
+				OAuth:   &OAuthClientConfig{RedirectURI: "https://gateway.example.net/oauth/callback", CallbackListen: "0.0.0.0:8090"},
+				Options: &OptionsV2{},
+			}
+		}, wantErr: ".oauth.callbackListen: callback listen address must use localhost or a loopback IP"},
 		{name: "secret without client ID", mutate: func(c *Config) {
 			c.McpServers["stdio"] = &MCPClientConfigV2{
 				URL:     "https://example.com/mcp",
@@ -190,6 +227,42 @@ func TestNewConfProviderLeavesDefaultClientUntouched(t *testing.T) {
 	}
 }
 
+// Defaults: an omitted mcpProxy.type means streamable-http, and a url-only
+// server means a streamable-http downstream.
+func TestLoadDefaultsToStreamableHTTP(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	data := []byte(`{
+		"mcpProxy": {
+			"baseURL": "http://localhost:9090",
+			"addr": ":9090",
+			"name": "test",
+			"version": "test"
+		},
+		"mcpServers": {
+			"remote": {"url": "https://example.com/mcp"}
+		}
+	}`)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	config, err := load(path, false, false, "", 10)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if config.McpProxy.Type != MCPServerTypeStreamable {
+		t.Errorf("mcpProxy.type = %q, want %q", config.McpProxy.Type, MCPServerTypeStreamable)
+	}
+	parsed, err := parseMCPClientConfigV2(config.McpServers["remote"])
+	if err != nil {
+		t.Fatalf("parse remote server: %v", err)
+	}
+	if _, ok := parsed.(*StreamableMCPClientConfig); !ok {
+		t.Errorf("url-only server parsed as %T, want *StreamableMCPClientConfig", parsed)
+	}
+}
+
 func TestLoadRejectsInvalidServerConfig(t *testing.T) {
 	t.Parallel()
 
@@ -215,28 +288,6 @@ func TestLoadRejectsInvalidServerConfig(t *testing.T) {
 	}
 }
 
-// The v1 schema is gone. A v1 file has no "mcpProxy" key, so without an
-// explicit check it would fail with "mcpProxy is required" and no hint that
-// the file simply needs migrating.
-func TestLoadRejectsV1Config(t *testing.T) {
-	t.Parallel()
-
-	path := filepath.Join(t.TempDir(), "config.json")
-	data := []byte(`{
-		"server": {"baseURL": "http://localhost:9090", "addr": ":9090", "name": "test", "version": "test"},
-		"clients": {
-			"fetch": {"type": "stdio", "config": {"command": "uvx", "args": ["mcp-server-fetch"]}}
-		}
-	}`)
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-	_, err := load(path, false, false, "", 10)
-	if err == nil || !strings.Contains(err.Error(), "mcpServers") {
-		t.Fatalf("load error = %v, want a migration hint naming the v2 keys", err)
-	}
-}
-
 func TestDurationUnmarshal(t *testing.T) {
 	t.Parallel()
 
@@ -248,11 +299,11 @@ func TestDurationUnmarshal(t *testing.T) {
 	}{
 		{name: "duration string", json: `"30s"`, want: 30 * time.Second},
 		{name: "minutes", json: `"1m30s"`, want: 90 * time.Second},
-		{name: "bare number is nanoseconds", json: `30000000000`, want: 30 * time.Second},
-		{name: "zero", json: `0`, want: 0},
-		// Decoding null into a plain time.Duration was always a no-op, so it
-		// still has to mean "unset" rather than fail the whole config.
 		{name: "null is unset", json: `null`, want: 0},
+		// A bare number reads as seconds to most people but decodes as
+		// nanoseconds, so it is rejected rather than silently misapplied.
+		{name: "bare number rejected", json: `30000000000`, wantErr: true},
+		{name: "zero number rejected", json: `0`, wantErr: true},
 		{name: "bad string", json: `"soon"`, wantErr: true},
 		{name: "bad type", json: `true`, wantErr: true},
 	}
@@ -276,15 +327,9 @@ func TestDurationUnmarshal(t *testing.T) {
 	}
 }
 
-// A bare 30 decodes to 30 nanoseconds, which silently broke every request to
-// that server. It has to be rejected with a message about the unit.
-func TestValidateDurationRejectsNanosecondMistake(t *testing.T) {
+func TestValidateDuration(t *testing.T) {
 	t.Parallel()
 
-	err := validateDuration("timeout", 30)
-	if err == nil || !strings.Contains(err.Error(), `"30s"`) || !strings.Contains(err.Error(), "timeout") {
-		t.Fatalf("validateDuration(30ns) = %v, want an error naming the field and suggesting a duration string", err)
-	}
 	if err := validateDuration("timeout", -1); err == nil {
 		t.Fatal("validateDuration(-1) = nil, want an error")
 	}
@@ -435,5 +480,106 @@ func TestLoadInheritsProxyOptions(t *testing.T) {
 	}
 	if got := overrides.reconnectInterval(); got != 2*time.Second {
 		t.Errorf("overridden reconnectInterval = %v, want 2s", got)
+	}
+}
+
+func TestToolFilterIsInheritedFromProxyOptions(t *testing.T) {
+	t.Parallel()
+
+	// A server with no toolFilter of its own inherits mcpProxy.options' one;
+	// a server that sets one keeps it (no merging).
+	dir := t.TempDir()
+	path := dir + "/config.json"
+	writeFile(t, path, `{
+		"mcpProxy": {
+			"baseURL": "http://127.0.0.1:9090",
+			"addr": ":9090",
+			"name": "proxy",
+			"version": "1.0.0",
+			"type": "streamable-http",
+			"options": {"toolFilter": {"mode": "block", "list": ["blocked"]}}
+		},
+		"mcpServers": {
+			"inherits": {"command": "/bin/true"},
+			"own": {"command": "/bin/true", "options": {"toolFilter": {"mode": "block", "list": ["other"]}}}
+		}
+	}`)
+
+	config, err := load(path, false, true, "", 10)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	inherits := config.McpServers["inherits"]
+	if inherits == nil || inherits.Options == nil || inherits.Options.ToolFilter == nil {
+		t.Fatal("server without a toolFilter should inherit mcpProxy.options.toolFilter")
+	}
+	if got := toolFilterFunc("inherits", inherits.Options)("blocked"); got {
+		t.Error("inherited block list must block the listed tool")
+	}
+
+	own := config.McpServers["own"]
+	if own == nil || own.Options == nil || own.Options.ToolFilter == nil {
+		t.Fatal("per-server toolFilter should survive load")
+	}
+	if got := toolFilterFunc("own", own.Options)("blocked"); !got {
+		t.Error("a server's own filter replaces the inherited one, so 'blocked' stays exposed")
+	}
+	if got := toolFilterFunc("own", own.Options)("other"); got {
+		t.Error("the server's own block list must block the listed tool")
+	}
+}
+
+// A malformed downstream URL in config is reported by load(); the parse
+// error embeds the raw URL, so it must be redacted before it is logged/printed.
+func TestValidateHTTPURLRedactsMalformedURLCredential(t *testing.T) {
+	t.Parallel()
+
+	// The second shape is the one that defeated two earlier redactor attempts:
+	// net/url truncates it at the '#', leaving the credential as bare userinfo
+	// with no '@' to detect.
+	for _, raw := range []string{
+		"http://ho st/mcp?key=CFG_SECRET",
+		"https://user:SUPERSECRET#frag@example.com/mcp",
+		"https://user:SUPERSECRET?@example.com/mcp",
+		"//user:NOSCHEMESECRET@ho st/mcp?key=Q",
+		"https://user:SUPERSECRET",
+	} {
+		err := validateHTTPURL("mcpServers[\"bad\"].url", raw)
+		if err == nil {
+			t.Errorf("%q: expected a malformed URL to be rejected", raw)
+			continue
+		}
+		for _, secret := range []string{"CFG_SECRET", "SUPERSECRET", "NOSCHEMESECRET"} {
+			if strings.Contains(err.Error(), secret) {
+				t.Errorf("%q leaked %q: %s", raw, secret, err)
+			}
+		}
+	}
+}
+
+func TestValidateConfigRejectsBadResourceAndPromptFilters(t *testing.T) {
+	t.Parallel()
+
+	for _, field := range []string{"resourceFilter", "promptFilter"} {
+		for _, tc := range []struct {
+			filter  *FilterConfig
+			wantErr string
+		}{
+			{filter: &FilterConfig{Mode: "permit"}, wantErr: field + ".mode"},
+			{filter: &FilterConfig{Mode: FilterModeAllow}, wantErr: field + ".list cannot be empty in allow mode"},
+			{filter: &FilterConfig{Mode: FilterModeBlock, List: []string{" "}}, wantErr: field + ".list[0]"},
+		} {
+			options := &OptionsV2{}
+			if field == "resourceFilter" {
+				options.ResourceFilter = tc.filter
+			} else {
+				options.PromptFilter = tc.filter
+			}
+			err := validateOptions("mcpServers[\"s\"].options", options)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("%s: err = %v, want it to mention %q", field, err, tc.wantErr)
+			}
+		}
 	}
 }

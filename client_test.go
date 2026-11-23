@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
@@ -17,6 +19,7 @@ import (
 	"github.com/mark3labs/mcp-go/client/transport"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"github.com/tbxark/optional-go"
 )
 
 func TestMCPHTTPClientRequestsUncompressedResponses(t *testing.T) {
@@ -201,12 +204,13 @@ type rawDownstream struct {
 
 	// Optional descriptor/metadata controls. Zero values preserve the original
 	// empty-catalog behaviour.
-	toolExecution     map[string]any   // attached to every listed tool when set
-	toolsRaw          json.RawMessage  // verbatim tools array; overrides tools when set
-	resourceTemplates []map[string]any // raw templates; []any{} when nil
-	prompts           []string         // prompt names; none when nil
-	resources         []string         // resource URIs; none when nil
-	hangMethods       map[string]bool  // methods that accept and never answer
+	toolExecution     map[string]any    // attached to every listed tool when set
+	toolsRaw          json.RawMessage   // verbatim tools array; overrides tools when set
+	resourceTemplates []map[string]any  // raw templates; []any{} when nil
+	prompts           []string          // prompt names; none when nil
+	resources         []string          // resource URIs; none when nil
+	resourceNames     map[string]string // resource URI -> name; the URI when unset
+	hangMethods       map[string]bool   // methods that accept and never answer
 
 	server *httptest.Server
 }
@@ -226,6 +230,9 @@ func newRawDownstream(t *testing.T) *rawDownstream {
 		var req struct {
 			ID     json.RawMessage `json:"id"`
 			Method string          `json:"method"`
+			Params struct {
+				URI string `json:"uri"`
+			} `json:"params"`
 		}
 		if err := json.Unmarshal(body, &req); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
@@ -300,12 +307,21 @@ func newRawDownstream(t *testing.T) *rawDownstream {
 		case "resources/list":
 			d.mu.Lock()
 			uris := slices.Clone(d.resources)
+			names := maps.Clone(d.resourceNames)
 			d.mu.Unlock()
 			resources := make([]map[string]any, 0, len(uris))
 			for _, uri := range uris {
-				resources = append(resources, map[string]any{"uri": uri, "name": uri})
+				name := uri
+				if named, ok := names[uri]; ok {
+					name = named
+				}
+				resources = append(resources, map[string]any{"uri": uri, "name": name})
 			}
 			writeResult(map[string]any{"resources": resources})
+		case "resources/read":
+			// Echo the URI back, so a test can tell a forwarded read from one the
+			// proxy refused.
+			writeResult(map[string]any{"contents": []map[string]any{{"uri": req.Params.URI, "text": "read " + req.Params.URI}}})
 		case "resources/templates/list":
 			d.mu.Lock()
 			templates := d.resourceTemplates
@@ -355,6 +371,15 @@ func (d *rawDownstream) setResources(uris ...string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.resources = slices.Clone(uris)
+}
+
+func (d *rawDownstream) setResourceName(uri, name string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.resourceNames == nil {
+		d.resourceNames = make(map[string]string)
+	}
+	d.resourceNames[uri] = name
 }
 
 func (d *rawDownstream) setToolExecution(execution map[string]any) {
@@ -667,4 +692,1602 @@ func TestNilOptionsClientDoesNotPanicOnConnect(t *testing.T) {
 	// Let the keepalive task run a tick; a nil dereference there crashes the
 	// process rather than this goroutine.
 	time.Sleep(100 * time.Millisecond)
+}
+
+// The proxy advertises only the capabilities it implements: no logging (it
+// does not forward log levels) and no resources.subscribe (it never emits
+// resources/updated nor forwards subscriptions).
+func TestNewMCPServerAdvertisedCapabilities(t *testing.T) {
+	t.Parallel()
+
+	s := newProxyServerForTest(t)
+	msg := []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}`)
+	raw, err := json.Marshal(s.HandleMessage(context.Background(), msg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out struct {
+		Result struct {
+			Capabilities struct {
+				Logging   *struct{} `json:"logging"`
+				Resources *struct {
+					Subscribe bool `json:"subscribe"`
+				} `json:"resources"`
+			} `json:"capabilities"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatal(err)
+	}
+	caps := out.Result.Capabilities
+	if caps.Logging != nil {
+		t.Error("logging capability must not be advertised: the proxy does not implement logging")
+	}
+	if caps.Resources != nil && caps.Resources.Subscribe {
+		t.Error("resources.subscribe must not be advertised: the proxy does not forward subscriptions")
+	}
+}
+
+// A downstream resource template without a uriTemplate used to reach
+// mcp-go's SetResourceTemplates, which dereferences the nil URITemplate and
+// panics the shared process. It must be skipped instead.
+func TestResourceTemplateWithoutURITemplateIsSkipped(t *testing.T) {
+	t.Parallel()
+
+	downstream := newRawDownstream(t)
+	downstream.setTools("alpha")
+	downstream.setResourceTemplates(
+		map[string]any{"name": "missing", "description": "no uriTemplate"},
+		map[string]any{"name": "explicit-null", "uriTemplate": nil},
+		map[string]any{"name": "good", "uriTemplate": "test://echo/{word}"},
+	)
+
+	mcpClient, err := newMCPClient("test", &MCPClientConfigV2{
+		TransportType: MCPClientTypeStreamable,
+		URL:           downstream.url,
+		Options:       &OptionsV2{},
+	})
+	if err != nil {
+		t.Fatalf("newMCPClient: %v", err)
+	}
+	defer func() { _ = mcpClient.Close() }()
+
+	proxyServer := newProxyServerForTest(t)
+	if err := mcpClient.addToMCPServer(t.Context(), mcp.Implementation{Name: "test"}, proxyServer); err != nil {
+		t.Fatalf("addToMCPServer: %v", err)
+	}
+
+	got := serverResourceTemplateNames(t, proxyServer)
+	if !slices.Equal(got, []string{"good"}) {
+		t.Fatalf("registered resource templates = %v, want only [good]", got)
+	}
+}
+
+// serverResourceTemplateNames reads back the resource templates registered on
+// the proxy-side server.
+func serverResourceTemplateNames(t *testing.T, mcpServer *server.MCPServer) []string {
+	t.Helper()
+
+	resp := mcpServer.HandleMessage(context.Background(), []byte(`{
+		"jsonrpc": "2.0", "id": 1, "method": "resources/templates/list", "params": {}
+	}`))
+	raw, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("marshal templates/list response: %v", err)
+	}
+	var decoded struct {
+		Result struct {
+			ResourceTemplates []struct {
+				Name string `json:"name"`
+			} `json:"resourceTemplates"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal templates/list response: %v", err)
+	}
+	names := make([]string, 0, len(decoded.Result.ResourceTemplates))
+	for _, template := range decoded.Result.ResourceTemplates {
+		names = append(names, template.Name)
+	}
+	slices.Sort(names)
+	return names
+}
+
+func TestToolFilterFunc(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		options *OptionsV2
+		tool    string
+		want    bool
+	}{
+		{name: "nil options allows", options: nil, tool: "any", want: true},
+		{name: "nil filter allows", options: &OptionsV2{}, tool: "any", want: true},
+		{name: "allow list membership", options: &OptionsV2{ToolFilter: &FilterConfig{Mode: FilterModeAllow, List: []string{"a"}}}, tool: "a", want: true},
+		{name: "allow list exclusion", options: &OptionsV2{ToolFilter: &FilterConfig{Mode: FilterModeAllow, List: []string{"a"}}}, tool: "b", want: false},
+		{name: "empty block list allows", options: &OptionsV2{ToolFilter: &FilterConfig{Mode: FilterModeBlock}}, tool: "any", want: true},
+		{name: "block list excludes", options: &OptionsV2{ToolFilter: &FilterConfig{Mode: FilterModeBlock, List: []string{"b"}}}, tool: "b", want: false},
+		// Validation rejects unknown modes, so this is only reachable with a
+		// programmatically built config; it fails closed.
+		{name: "unknown mode hides all", options: &OptionsV2{ToolFilter: &FilterConfig{Mode: FilterMode("nonsense")}}, tool: "any", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := toolFilterFunc("test", tt.options)(tt.tool); got != tt.want {
+				t.Errorf("toolFilterFunc(%s)(%s) = %v, want %v", tt.name, tt.tool, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDownstreamExecutionMetadataIsStripped(t *testing.T) {
+	t.Parallel()
+
+	downstream := newRawDownstream(t)
+	downstream.setTools("danger")
+	downstream.setToolExecution(map[string]any{"taskSupport": "required"})
+
+	mcpClient, err := newMCPClient("test", &MCPClientConfigV2{
+		TransportType: MCPClientTypeStreamable,
+		URL:           downstream.url,
+		Options:       &OptionsV2{},
+	})
+	if err != nil {
+		t.Fatalf("newMCPClient: %v", err)
+	}
+	defer func() { _ = mcpClient.Close() }()
+
+	proxyServer := newProxyServerForTest(t)
+	if err := mcpClient.addToMCPServer(t.Context(), mcp.Implementation{Name: "test"}, proxyServer); err != nil {
+		t.Fatalf("addToMCPServer: %v", err)
+	}
+
+	resp := proxyServer.HandleMessage(context.Background(), []byte(`{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}
+	}`))
+	raw, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("marshal tools/list response: %v", err)
+	}
+	if strings.Contains(string(raw), "taskSupport") || strings.Contains(string(raw), `"execution"`) {
+		t.Fatalf("republished tool kept downstream execution metadata: %s", raw)
+	}
+	if !strings.Contains(string(raw), "danger") {
+		t.Fatalf("the tool itself should still be advertised: %s", raw)
+	}
+}
+
+// The configured per-request bound must apply to resource reads, not
+// only tool calls. A downstream that accepts a read and never answers used to
+// hold the shared channel for the caller's whole deadline.
+func TestResourceReadHonorsRequestTimeout(t *testing.T) {
+	t.Parallel()
+
+	downstream := newRawDownstream(t)
+	downstream.setTools("alpha")
+	downstream.setResources("test://hang")
+	downstream.hangMethodsNamed("resources/read")
+
+	mcpClient, err := newMCPClient("test", &MCPClientConfigV2{
+		TransportType: MCPClientTypeStreamable,
+		URL:           downstream.url,
+		Options:       &OptionsV2{},
+	})
+	if err != nil {
+		t.Fatalf("newMCPClient: %v", err)
+	}
+	defer func() { _ = mcpClient.Close() }()
+
+	proxyServer := newProxyServerForTest(t)
+	ctx := t.Context()
+	if err := mcpClient.addToMCPServer(ctx, mcp.Implementation{Name: "test"}, proxyServer); err != nil {
+		t.Fatalf("addToMCPServer: %v", err)
+	}
+
+	// Bound is normally set only for stdio; the forwarding logic it drives is
+	// shared, so exercising it on a streamable client keeps the test in-process.
+	mcpClient.requestTimeout = 250 * time.Millisecond
+
+	callerCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err = mcpClient.readResource(callerCtx, mcp.ReadResourceRequest{
+		Params: mcp.ReadResourceParams{URI: "test://hang"},
+	})
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("readResource succeeded against a downstream that never answers")
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("readResource took %v; it ignored the configured request timeout", elapsed)
+	}
+}
+
+// The prompt path must be bounded the same way.
+func TestPromptGetHonorsRequestTimeout(t *testing.T) {
+	t.Parallel()
+
+	downstream := newRawDownstream(t)
+	downstream.setTools("alpha")
+	downstream.setPrompts("hang")
+	downstream.hangMethodsNamed("prompts/get")
+
+	mcpClient, err := newMCPClient("test", &MCPClientConfigV2{
+		TransportType: MCPClientTypeStreamable,
+		URL:           downstream.url,
+		Options:       &OptionsV2{},
+	})
+	if err != nil {
+		t.Fatalf("newMCPClient: %v", err)
+	}
+	defer func() { _ = mcpClient.Close() }()
+
+	proxyServer := newProxyServerForTest(t)
+	ctx := t.Context()
+	if err := mcpClient.addToMCPServer(ctx, mcp.Implementation{Name: "test"}, proxyServer); err != nil {
+		t.Fatalf("addToMCPServer: %v", err)
+	}
+	mcpClient.requestTimeout = 250 * time.Millisecond
+
+	callerCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	resp := proxyServer.HandleMessage(callerCtx, []byte(`{
+		"jsonrpc": "2.0", "id": 1, "method": "prompts/get",
+		"params": {"name": "hang"}
+	}`))
+	raw, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("marshal prompts/get response: %v", err)
+	}
+	// The handler is bounded, so the call must have produced a JSON-RPC error
+	// rather than blocking until the caller's 30s deadline.
+	if !strings.Contains(string(raw), `"error"`) {
+		t.Fatalf("prompts/get against a hanging downstream should error, got %s", raw)
+	}
+}
+
+// A credential carried in a downstream URL query must not survive into
+// an error message that reaches a caller or the log.
+func TestRedactURLCredentials(t *testing.T) {
+	t.Parallel()
+
+	credentialed := `Post "https://mcp.example.com/mcp?key=SECRET&token=OTHER": dial tcp: refused`
+	_ = credentialed
+	err := &url.Error{Op: "Post", URL: "https://mcp.example.com/mcp?key=SECRET&token=OTHER", Err: errors.New("dial tcp: refused")}
+
+	redacted := redactURLCredentials(err)
+	message := redacted.Error()
+	for _, secret := range []string{"SECRET", "OTHER", "key=", "token="} {
+		if strings.Contains(message, secret) {
+			t.Errorf("redacted message still contains %q: %s", secret, message)
+		}
+	}
+	if !strings.Contains(message, "mcp.example.com") {
+		t.Errorf("redaction dropped too much, the host is not diagnostic: %s", message)
+	}
+	if !errors.Is(redacted, err) {
+		t.Error("redaction must preserve the original error in the chain for errors.As/Is")
+	}
+
+	// A non-URL error is returned unchanged.
+	plain := errors.New("boom")
+	if got := redactURLCredentials(plain); got != plain {
+		t.Errorf("plain error should pass through, got %v", got)
+	}
+	if got := redactURLCredentials(nil); got != nil {
+		t.Errorf("nil error should stay nil, got %v", got)
+	}
+}
+
+// End to end: the error a caller receives after a downstream transport
+// failure must not contain the configured query credential.
+func TestToolCallErrorRedactsURLCredential(t *testing.T) {
+	t.Parallel()
+
+	const secret = "SECRETTOKEN"
+	downstream := newRawDownstream(t)
+	downstream.setTools("alpha")
+
+	mcpClient, err := newMCPClient("test", &MCPClientConfigV2{
+		TransportType: MCPClientTypeStreamable,
+		// The credential the docs recommend putting in the URL query.
+		URL:     downstream.url + "?key=" + secret,
+		Options: &OptionsV2{},
+	})
+	if err != nil {
+		t.Fatalf("newMCPClient: %v", err)
+	}
+	defer func() { _ = mcpClient.Close() }()
+
+	proxyServer := newProxyServerForTest(t)
+	ctx := t.Context()
+	if err := mcpClient.addToMCPServer(ctx, mcp.Implementation{Name: "test"}, proxyServer); err != nil {
+		t.Fatalf("addToMCPServer: %v", err)
+	}
+
+	// Take the downstream away, then call the registered tool: the transport
+	// failure embeds the credentialed URL in a *url.Error.
+	downstream.close()
+
+	resp := proxyServer.HandleMessage(ctx, []byte(`{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": {"name": "alpha", "arguments": {}}
+	}`))
+	raw, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("marshal tools/call response: %v", err)
+	}
+	message := string(raw)
+	if strings.Contains(message, secret) {
+		t.Fatalf("caller-visible error disclosed the URL query credential: %s", message)
+	}
+	if !strings.Contains(message, `"error"`) {
+		t.Fatalf("a call to a dead downstream should return an error, got %s", message)
+	}
+}
+
+// A URL that fails to parse must still be redacted. The first cut used
+// url.Parse and silently returned the original text when parsing failed, which
+// leaked the credential in exactly the malformed-URL case.
+func TestRedactURLCredentialsHandlesUnparseableURL(t *testing.T) {
+	t.Parallel()
+
+	for _, raw := range []string{
+		"http://ho st/mcp?key=PARSE_SECRET",
+		"://?key=PARSE_SECRET",
+		"http://user:pw@ho st/x?key=PARSE_SECRET#frag",
+	} {
+		urlErr := &url.Error{Op: "Post", URL: raw, Err: errors.New("boom")}
+		got := redactURLCredentials(urlErr).Error()
+		if strings.Contains(got, "PARSE_SECRET") {
+			t.Errorf("unparseable URL %q leaked its query credential: %s", raw, got)
+		}
+		if strings.Contains(got, "pw@") {
+			t.Errorf("unparseable URL %q leaked its userinfo: %s", raw, got)
+		}
+	}
+
+	// A URL with no credential is left untouched, and the original error stays
+	// in the chain so classification is preserved.
+	clean := &url.Error{Op: "Post", URL: "https://mcp.example.com/mcp", Err: errors.New("boom")}
+	if got := redactURLCredentials(clean); got != error(clean) {
+		t.Errorf("a credential-free URL should pass through unchanged, got %v", got)
+	}
+}
+
+// The reconnect log and the -doctor live column are further sinks for a
+// transport error, which embeds the credentialed downstream URL.
+func TestURLRedactionCoversReconnectAndDoctorSinks(t *testing.T) {
+	t.Parallel()
+
+	urlErr := func() error {
+		return &url.Error{Op: "Post", URL: "https://mcp.example.com/mcp?key=SINK_SECRET", Err: errors.New("refused")}
+	}
+
+	// Reconnect path: the error that reaches the log must be redacted.
+	downstream := newRawDownstream(t)
+	downstream.setTools("alpha")
+	mcpClient, err := newMCPClient("test", &MCPClientConfigV2{
+		TransportType: MCPClientTypeStreamable,
+		URL:           downstream.url + "?key=SINK_SECRET",
+		Options:       &OptionsV2{},
+	})
+	if err != nil {
+		t.Fatalf("newMCPClient: %v", err)
+	}
+	defer func() { _ = mcpClient.Close() }()
+	if err := mcpClient.addToMCPServer(t.Context(), mcp.Implementation{Name: "test"}, newProxyServerForTest(t)); err != nil {
+		t.Fatalf("addToMCPServer: %v", err)
+	}
+	downstream.close()
+	reconnectErr := mcpClient.connect(t.Context(), mcp.Implementation{Name: "test"}, mcpClient.mcpServer)
+	if reconnectErr == nil {
+		t.Fatal("expected the reconnect to fail after the downstream closed")
+	}
+	if strings.Contains(redactURLCredentials(reconnectErr).Error(), "SINK_SECRET") {
+		t.Error("the reconnect error still carries the URL query credential into the log")
+	}
+
+	// Doctor path: liveFailureMessage is printed to the report.
+	if message := liveFailureMessage("test", urlErr()); strings.Contains(message, "SINK_SECRET") {
+		t.Errorf("-doctor live column disclosed the URL query credential: %s", message)
+	}
+	if message := liveFailureMessage("test", urlErr()); !strings.Contains(message, "mcp.example.com") {
+		t.Errorf("-doctor message lost the diagnostic host: %s", message)
+	}
+}
+
+// Url.Error renders its URL with %q, so a credential containing a quote
+// or backslash does not appear verbatim in the message. Replacing the raw URL
+// silently did nothing and leaked it; redaction must rebuild the rendered form.
+func TestRedactURLCredentialsHandlesQuotedSecret(t *testing.T) {
+	t.Parallel()
+
+	for _, secret := range []string{`SEC"RET`, `SEC\RET`, `SEC\"RET`, "SEC`RET"} {
+		urlErr := &url.Error{Op: "Post", URL: "https://mcp.example.com/mcp?key=" + secret, Err: errors.New("refused")}
+		got := redactURLCredentials(urlErr).Error()
+		if strings.Contains(got, secret) {
+			t.Errorf("secret %q survived redaction: %s", secret, got)
+		}
+		// The failure-classification chain must survive too.
+		if _, ok := errors.AsType[*url.Error](redactURLCredentials(urlErr)); !ok {
+			t.Errorf("errors.As(*url.Error) failed after redaction of %q", secret)
+		}
+	}
+}
+
+// A transport error nested inside a wrapper (as the transports produce)
+// must also be redacted, including a quoted credential.
+func TestRedactURLCredentialsNestedWrapper(t *testing.T) {
+	t.Parallel()
+
+	wrapped := fmt.Errorf("transport error: %w", &url.Error{Op: "Post", URL: `http://127.0.0.1:1/mcp?key=NEST"ED`, Err: errors.New("refused")})
+	got := redactURLCredentials(wrapped).Error()
+	if strings.Contains(got, `NEST"ED`) || strings.Contains(got, "key=") {
+		t.Fatalf("nested transport error leaked the credential: %s", got)
+	}
+	if !strings.Contains(got, "transport error") || !strings.Contains(got, "127.0.0.1") {
+		t.Fatalf("redaction lost the diagnostic context: %s", got)
+	}
+}
+
+// The redactor itself must survive the truncated-userinfo shape that
+// net/url produces for an unparseable URL.
+func TestRedactURLStringTruncatedUserinfo(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		raw         string
+		mustNotHave []string
+	}{
+		{"https://user:SUPERSECRET", []string{"SUPERSECRET"}},
+		{"//user:NOSCHEMESECRET@ho st/mcp?key=Q", []string{"NOSCHEMESECRET", "Q"}},
+		{"https://user:SEC#frag@example.com/mcp", []string{"SEC"}},
+		{"scheme://user:pass@host:8080/path?k=v#f", []string{"pass", "k=v", "f"}},
+	}
+	for _, tt := range tests {
+		got := redactURLString(tt.raw)
+		for _, secret := range tt.mustNotHave {
+			if strings.Contains(got, secret) {
+				t.Errorf("redactURLString(%q) = %q still contains %q", tt.raw, got, secret)
+			}
+		}
+	}
+
+	// A credential-free URL is returned byte-identical, and the port survives
+	// when there is a path, so diagnostics stay useful.
+	for _, clean := range []string{"http://127.0.0.1:9/mcp", "https://mcp.example.com/sse"} {
+		if got := redactURLString(clean); got != clean {
+			t.Errorf("credential-free URL changed: %q -> %q", clean, got)
+		}
+	}
+}
+
+// A hostile matrix over every credential location. The redactor must
+// not echo a secret from userinfo, query, or fragment - including for inputs
+// that do not parse as URLs at all, which is where two earlier attempts leaked.
+func TestRedactURLCredentialsDropsContaminatedReason(t *testing.T) {
+	t.Parallel()
+
+	// A malformed URL can contaminate the parser's REASON, not just the URL.
+	// net/url truncates at the first '#' and then reports the credential as a
+	// bad port. This mirrors the exact shape observed from
+	// url.Parse("https://user:<secret>#frag@example.com/mcp"):
+	//   parse "https://user:SUPERSECRET": invalid port ":SUPERSECRET" after host
+	// Redacting only the URL would leave the secret in the reason, so the whole
+	// reason is dropped. Built directly so the test does not depend on the
+	// exact wording net/url happens to produce.
+	urlErr := &url.Error{
+		Op:  "parse",
+		URL: "https://user:SUPERSECRET",
+		Err: errors.New(`invalid port ":SUPERSECRET" after host`),
+	}
+
+	message := redactURLCredentials(urlErr).Error()
+	if strings.Contains(message, "SUPERSECRET") {
+		t.Fatalf("credential survived in the parse reason: %s", message)
+	}
+	if !strings.Contains(message, "redacted-url") {
+		t.Fatalf("expected the URL to be replaced with the placeholder: %s", message)
+	}
+	// The parse error must still be reachable for callers that inspect it.
+	if _, ok := errors.AsType[*url.Error](redactURLCredentials(urlErr)); !ok {
+		t.Error("errors.As(*url.Error) must still succeed")
+	}
+}
+
+func TestRedactURLStringCredentialLocations(t *testing.T) {
+	t.Parallel()
+
+	secrets := []string{"S3CRET", `S3"C`, `S3\C`, "S3\nC", "S3%C", "S3@C", "S3#C", "S3?C", "ключ", "S3 C"}
+	// Only userinfo, query and fragment are credential locations; the path is
+	// preserved on purpose because it is diagnostic and not a secret slot.
+	templates := []string{
+		"https://h/p?key=%s",
+		"https://u:%s@h/p",
+		"https://h/p?key=%s&key=y",
+		"https://u:%s",
+		"//u:%s@ho st/p?k=1",
+		"https://h/p?a=%s#%s",
+		"https://%s@h",
+		"https://h:%s/p",
+		"https://h/p#%s",
+		"https://h/p?%s",
+	}
+	for _, secret := range secrets {
+		for _, template := range templates {
+			raw := strings.ReplaceAll(template, "%s", secret)
+			if got := redactURLString(raw); strings.Contains(got, secret) {
+				t.Errorf("template %q leaked secret %q -> %q", template, secret, got)
+			}
+		}
+	}
+
+	// Inputs that do not parse are replaced wholesale, never echoed.
+	for _, raw := range []string{"not a url at all", ":://", "user:SUPERSECRET", "ho st", "//u:S@ho st/p"} {
+		got := redactURLString(raw)
+		if strings.Contains(got, "SUPERSECRET") || strings.Contains(got, "S@") {
+			t.Errorf("unparseable %q leaked: %q", raw, got)
+		}
+		if got != redactedURLPlaceholder {
+			t.Errorf("unparseable %q should become the placeholder, got %q", raw, got)
+		}
+	}
+
+	// Credential-free URLs stay byte-identical so diagnostics remain useful.
+	for _, clean := range []string{"http://127.0.0.1:9/mcp", "https://mcp.example.com/sse", "https://h:8443/p"} {
+		if got := redactURLString(clean); got != clean {
+			t.Errorf("clean URL changed: %q -> %q", clean, got)
+		}
+	}
+}
+func initializeInstructions(t *testing.T, s *server.MCPServer) string {
+	t.Helper()
+	msg := []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}`)
+	raw, err := json.Marshal(s.HandleMessage(context.Background(), msg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out struct {
+		Result struct {
+			Instructions string `json:"instructions"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatal(err)
+	}
+	return out.Result.Instructions
+}
+
+func TestForwardInstructionsFromBackend(t *testing.T) {
+	s := server.NewMCPServer("beis", "1.0.0")
+	forwardInstructions(s, &mcp.InitializeResult{Instructions: "BEIS house lessons: ..."})
+	if got := initializeInstructions(t, s); got != "BEIS house lessons: ..." {
+		t.Fatalf("instructions = %q", got)
+	}
+}
+
+func TestForwardInstructionsIgnoresEmptyAndNil(t *testing.T) {
+	s := server.NewMCPServer("beis", "1.0.0", server.WithInstructions("keep"))
+	forwardInstructions(s, nil)
+	forwardInstructions(s, &mcp.InitializeResult{})
+	if got := initializeInstructions(t, s); got != "keep" {
+		t.Fatalf("instructions = %q", got)
+	}
+}
+
+// lifecycleOptions probes fast and self-heals, which is the production shape
+// (mcpProxy.options.autoReconnect=true) that exposed the leak.
+func lifecycleOptions() *OptionsV2 {
+	o := &OptionsV2{
+		PingInterval:      Duration(20 * time.Millisecond),
+		ReconnectInterval: Duration(20 * time.Millisecond),
+	}
+	o.AutoReconnect.Set(true)
+	return o
+}
+
+func waitClosed(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	if ch == nil {
+		t.Fatalf("%s: channel is nil", what)
+	}
+	select {
+	case <-ch:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("%s did not end", what)
+	}
+}
+
+// Regression: a closed client's keepalive loop kept running for as long as the
+// context it was started with, which for boot-time servers is the proxy's own.
+// In production a route removed or replaced by a hot reload kept logging
+// "MCP health probe failed ... transport closed" and "Failed to reconnect
+// downstream ... client is closed" every pingInterval, forever.
+func TestCloseStopsKeepaliveLoopWhileParentContextLives(t *testing.T) {
+	t.Parallel()
+
+	downstream := newRawDownstream(t)
+	downstream.setTools("alpha")
+
+	mcpClient, err := newMCPClient("lifecycle", &MCPClientConfigV2{
+		TransportType: MCPClientTypeStreamable,
+		URL:           downstream.url,
+		Options:       lifecycleOptions(),
+	})
+	if err != nil {
+		t.Fatalf("newMCPClient: %v", err)
+	}
+
+	// The parent context stays alive for the whole test, like the proxy's.
+	if err := mcpClient.addToMCPServer(t.Context(), mcp.Implementation{Name: "test"}, newProxyServerForTest(t)); err != nil {
+		t.Fatalf("addToMCPServer: %v", err)
+	}
+	if err := mcpClient.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	waitClosed(t, mcpClient.pingDone, "keepalive loop of a closed client")
+}
+
+func TestShouldLogRepeatedFailure(t *testing.T) {
+	t.Parallel()
+	logged := 0
+	for i := 1; i <= 100; i++ {
+		if shouldLogRepeatedFailure(i) {
+			logged++
+		}
+	}
+	// 1..threshold, then every repeatedFailureLogEvery-th.
+	want := pingFailureThreshold + 100/repeatedFailureLogEvery
+	if logged != want {
+		t.Errorf("logged %d of 100 failures, want %d", logged, want)
+	}
+}
+
+// sessionDownstream is a stateful streamable-http endpoint that behaves like
+// the Python SDK's default server (and the TypeScript SDK's stateful one): it
+// issues a session id on initialize, answers an unknown session id with 404
+// and a request without one with 400 and a JSON-RPC error body. restart()
+// forgets every session, which is what a real server does when its process is
+// replaced.
+type sessionDownstream struct {
+	mu       sync.Mutex
+	sessions map[string]bool
+	next     int
+	inits    int
+	// calls counts tools/call requests that reached the handler, so a test can
+	// tell a retried call from one that ran twice.
+	calls int
+	url   string
+}
+
+func newSessionDownstream(t *testing.T) *sessionDownstream {
+	t.Helper()
+
+	d := &sessionDownstream{sessions: map[string]bool{}}
+	writeJSON := func(w http.ResponseWriter, status int, body any) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(body)
+	}
+	rpcError := func(message string) map[string]any {
+		return map[string]any{"jsonrpc": "2.0", "id": "server-error", "error": map[string]any{"code": -32600, "message": message}}
+	}
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+		case http.MethodDelete:
+			w.WriteHeader(http.StatusOK)
+			return
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		_ = r.Body.Close()
+		var req struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			writeJSON(w, http.StatusBadRequest, rpcError("Parse error"))
+			return
+		}
+
+		d.mu.Lock()
+		if req.Method == "initialize" {
+			d.next++
+			d.inits++
+			sid := fmt.Sprintf("session-%d", d.next)
+			d.sessions[sid] = true
+			d.mu.Unlock()
+			w.Header().Set("Mcp-Session-Id", sid)
+			writeJSON(w, http.StatusOK, map[string]any{
+				"jsonrpc": "2.0",
+				"id":      req.ID,
+				"result": map[string]any{
+					"protocolVersion": mcp.ProtocolVersion20250618,
+					"capabilities":    map[string]any{"tools": map[string]any{}},
+					"serverInfo":      map[string]string{"name": "stateful-downstream", "version": "1"},
+				},
+			})
+			return
+		}
+		sid := r.Header.Get("Mcp-Session-Id")
+		if sid == "" {
+			d.mu.Unlock()
+			writeJSON(w, http.StatusBadRequest, rpcError("Bad Request: Missing session ID"))
+			return
+		}
+		if !d.sessions[sid] {
+			d.mu.Unlock()
+			writeJSON(w, http.StatusNotFound, rpcError("Session not found"))
+			return
+		}
+		if req.ID == nil {
+			d.mu.Unlock()
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		if req.Method == "tools/call" {
+			d.calls++
+		}
+		d.mu.Unlock()
+
+		result := map[string]any{}
+		switch req.Method {
+		case "tools/list":
+			result["tools"] = []map[string]any{{"name": "echo", "inputSchema": map[string]any{"type": "object"}}}
+		case "tools/call":
+			result["content"] = []map[string]any{{"type": "text", "text": "ok"}}
+		case "prompts/list":
+			result["prompts"] = []any{}
+		case "resources/list":
+			result["resources"] = []any{}
+		case "resources/templates/list":
+			result["resourceTemplates"] = []any{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": result})
+	})
+	s := httptest.NewServer(handler)
+	t.Cleanup(s.Close)
+	d.url = s.URL
+	return d
+}
+
+// restart drops every session, as a replaced server process would.
+func (d *sessionDownstream) restart() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.sessions = map[string]bool{}
+}
+
+func (d *sessionDownstream) counts() (inits, calls int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.inits, d.calls
+}
+
+func connectSessionClient(t *testing.T, d *sessionDownstream, options *OptionsV2) *Client {
+	t.Helper()
+
+	c, err := newMCPClient("stateful", &MCPClientConfigV2{
+		TransportType: MCPClientTypeStreamable,
+		URL:           d.url,
+		Options:       options,
+	})
+	if err != nil {
+		t.Fatalf("newMCPClient: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	if err := c.addToMCPServer(t.Context(), mcp.Implementation{Name: "test"}, newProxyServerForTest(t)); err != nil {
+		t.Fatalf("addToMCPServer: %v", err)
+	}
+	if streamableSessionID(c.getClient()) == "" {
+		t.Fatal("downstream did not hand out a session; the test cannot exercise session loss")
+	}
+	return c
+}
+
+func echoRequest() mcp.CallToolRequest {
+	var request mcp.CallToolRequest
+	request.Params.Name = "echo"
+	return request
+}
+
+// A restarted downstream rejects the old session id. With autoReconnect the
+// call that runs into it rebuilds the connection and is retried once - and the
+// tool runs exactly once, because the rejected attempt never reached it.
+func TestCallToolRecoversWhenDownstreamRestarts(t *testing.T) {
+	t.Parallel()
+
+	d := newSessionDownstream(t)
+	// A long interval keeps the keepalive out of the way: the call itself must recover.
+	c := connectSessionClient(t, d, &OptionsV2{AutoReconnect: optional.NewField(true), PingInterval: Duration(time.Hour)})
+	d.restart()
+
+	result, err := c.callTool(t.Context(), echoRequest())
+	if err != nil {
+		t.Fatalf("callTool after downstream restart: %v", err)
+	}
+	if len(result.Content) != 1 {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+	inits, calls := d.counts()
+	if inits != 2 {
+		t.Errorf("initialize requests = %d, want 2 (connect and one rebuild)", inits)
+	}
+	if calls != 1 {
+		t.Errorf("tool executions = %d, want 1", calls)
+	}
+	if streamableSessionID(c.getClient()) == "" {
+		t.Error("rebuilt connection has no session")
+	}
+}
+
+// Without autoReconnect the proxy must not rebuild on its own: the call fails,
+// as before, and nothing reconnects behind the operator's back.
+func TestCallToolWithoutAutoReconnectDoesNotRebuild(t *testing.T) {
+	t.Parallel()
+
+	d := newSessionDownstream(t)
+	c := connectSessionClient(t, d, &OptionsV2{PingInterval: Duration(time.Hour)})
+	d.restart()
+
+	if _, err := c.callTool(t.Context(), echoRequest()); err == nil {
+		t.Fatal("callTool succeeded without autoReconnect; expected the lost-session error")
+	}
+	if inits, calls := d.counts(); inits != 1 || calls != 0 {
+		t.Errorf("initialize requests = %d, tool executions = %d; want 1 and 0", inits, calls)
+	}
+}
+
+// The keepalive is what finds a lost session when no request comes in. Before
+// this fix it never did: after the 404 the next probe went out without a
+// session, the server answered with a JSON-RPC error, the probe counted that as
+// alive, and the failure count never reached the threshold.
+func TestKeepaliveRebuildsLostSession(t *testing.T) {
+	t.Parallel()
+
+	d := newSessionDownstream(t)
+	c := connectSessionClient(t, d, &OptionsV2{AutoReconnect: optional.NewField(true), PingInterval: Duration(20 * time.Millisecond)})
+	d.restart()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if inits, _ := d.counts(); inits >= 2 && c.Health() == healthOK {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if inits, _ := d.counts(); inits < 2 {
+		t.Fatalf("keepalive did not rebuild the lost session (initialize requests = %d)", inits)
+	}
+	if c.Health() != healthOK {
+		t.Fatalf("health after rebuild = %v, want ok", c.Health())
+	}
+	if _, err := c.callTool(t.Context(), echoRequest()); err != nil {
+		t.Fatalf("callTool after keepalive rebuild: %v", err)
+	}
+}
+
+// Without autoReconnect a lost session must leave the client unhealthy - and
+// keep it there. Before this fix /_readyz kept reporting ok, because every
+// probe after the first answered with a JSON-RPC error.
+func TestKeepaliveReportsLostSessionWithoutAutoReconnect(t *testing.T) {
+	t.Parallel()
+
+	d := newSessionDownstream(t)
+	c := connectSessionClient(t, d, &OptionsV2{PingInterval: Duration(20 * time.Millisecond)})
+	d.restart()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && c.Health() != healthFailed {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if c.Health() != healthFailed {
+		t.Fatalf("health = %v, want failed after the downstream lost the session", c.Health())
+	}
+	// Several more probes: none of them may flip it back to ok.
+	time.Sleep(200 * time.Millisecond)
+	if c.Health() != healthFailed {
+		t.Fatalf("health flipped back to %v while the session is still lost", c.Health())
+	}
+	if inits, _ := d.counts(); inits != 1 {
+		t.Errorf("initialize requests = %d, want 1 (no rebuild without autoReconnect)", inits)
+	}
+}
+
+// Concurrent calls that all hit the same lost session rebuild the connection
+// once, and each of them runs exactly once.
+func TestConcurrentCallsRebuildOnce(t *testing.T) {
+	t.Parallel()
+
+	d := newSessionDownstream(t)
+	c := connectSessionClient(t, d, &OptionsV2{AutoReconnect: optional.NewField(true), PingInterval: Duration(time.Hour)})
+	d.restart()
+
+	const n = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for range n {
+		wg.Go(func() {
+			if _, err := c.callTool(t.Context(), echoRequest()); err != nil {
+				errs <- err
+			}
+		})
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("callTool: %v", err)
+	}
+	inits, calls := d.counts()
+	if inits != 2 {
+		t.Errorf("initialize requests = %d, want 2 (one rebuild for all callers)", inits)
+	}
+	if calls != n {
+		t.Errorf("tool executions = %d, want %d", calls, n)
+	}
+}
+
+// A replaced streamable-http transport waits out retireGrace before it is
+// closed; shutting the client down must not leave it open meanwhile.
+func TestCloseClosesRetiredTransports(t *testing.T) {
+	t.Parallel()
+
+	d := newSessionDownstream(t)
+	c := connectSessionClient(t, d, &OptionsV2{AutoReconnect: optional.NewField(true), PingInterval: Duration(time.Hour)})
+	old := c.getClient()
+	d.restart()
+	if _, err := c.callTool(t.Context(), echoRequest()); err != nil {
+		t.Fatalf("callTool after downstream restart: %v", err)
+	}
+	c.retiredMu.Lock()
+	_, waiting := c.retired[old]
+	c.retiredMu.Unlock()
+	if !waiting {
+		t.Fatal("the replaced transport was not kept for retireGrace")
+	}
+
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	c.retiredMu.Lock()
+	left := len(c.retired)
+	c.retiredMu.Unlock()
+	if left != 0 {
+		t.Errorf("%d retired transport(s) still open after Close", left)
+	}
+	if _, had := c.hadSession.Load(old); had {
+		t.Error("closed transport still recorded as having a session")
+	}
+}
+
+func TestSessionLost(t *testing.T) {
+	t.Parallel()
+
+	d := newSessionDownstream(t)
+	c := connectSessionClient(t, d, &OptionsV2{PingInterval: Duration(time.Hour)})
+	raw := c.getClient()
+
+	terminated := fmt.Errorf("failed to send request: %w", transport.ErrSessionTerminated)
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil error", err: nil, want: false},
+		{name: "session terminated", err: transport.NewError(terminated), want: true},
+		{name: "json-rpc error with the session intact", err: mcp.ErrInvalidRequest, want: false},
+		{name: "transport error with the session intact", err: transport.NewError(errors.New("eof")), want: false},
+	}
+	for _, tt := range tests {
+		if got := c.sessionLost(raw, tt.err); got != tt.want {
+			t.Errorf("%s: sessionLost = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+
+	// After the 404 mcp-go clears the session id; later calls on that transport
+	// fail with ErrSessionTerminated without reaching the wire.
+	d.restart()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	_, err := raw.CallTool(ctx, echoRequest())
+	if !errors.Is(err, transport.ErrSessionTerminated) {
+		t.Fatalf("first call after restart: err = %v, want ErrSessionTerminated", err)
+	}
+	_, err = raw.CallTool(ctx, echoRequest())
+	if !errors.Is(err, transport.ErrSessionTerminated) {
+		t.Fatalf("second call after restart: err = %v, want ErrSessionTerminated", err)
+	}
+	if !c.sessionLost(raw, err) {
+		t.Errorf("sessionLost(missing-session error) = false, want true")
+	}
+	if c.sessionLost(nil, err) {
+		t.Errorf("sessionLost(nil client) = true, want false")
+	}
+}
+
+func TestStripHopMetaDropsConnectionEnvelope(t *testing.T) {
+	t.Parallel()
+
+	in := &mcp.Meta{
+		ProgressToken: "p1",
+		AdditionalFields: map[string]any{
+			mcp.MetaKeyProtocolVersion:    mcp.ProtocolVersion20260728,
+			mcp.MetaKeyClientInfo:         map[string]any{"name": "caller"},
+			mcp.MetaKeyClientCapabilities: map[string]any{},
+			mcp.MetaKeyServerInfo:         map[string]any{"name": "proxy"},
+			mcp.MetaKeyLogLevel:           "debug",
+			mcp.MetaKeySubscriptionID:     "7",
+			"traceparent":                 "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+		},
+	}
+	out := stripHopMeta(in)
+
+	if out == nil || out.ProgressToken != "p1" {
+		t.Fatalf("progressToken lost: %#v", out)
+	}
+	for _, key := range hopMetaKeys {
+		if _, ok := out.AdditionalFields[key]; ok {
+			t.Errorf("%s forwarded: %#v", key, out.AdditionalFields)
+		}
+	}
+	if len(out.AdditionalFields) != 1 || out.AdditionalFields["traceparent"] == nil {
+		t.Errorf("unrelated fields not passed through: %#v", out.AdditionalFields)
+	}
+	// The inbound request's meta belongs to the caller; the proxy only edits a copy.
+	if len(in.AdditionalFields) != 7 {
+		t.Errorf("caller's meta was mutated: %#v", in.AdditionalFields)
+	}
+}
+
+func TestStripHopMetaEnvelopeOnly(t *testing.T) {
+	t.Parallel()
+
+	envelopeOnly := &mcp.Meta{AdditionalFields: map[string]any{mcp.MetaKeyProtocolVersion: mcp.ProtocolVersion20260728}}
+	if out := stripHopMeta(envelopeOnly); out != nil {
+		t.Errorf("envelope-only meta = %#v, want nil so no empty _meta is sent", out)
+	}
+	if out := stripHopMeta(nil); out != nil {
+		t.Errorf("nil meta = %#v, want nil", out)
+	}
+	progressOnly := &mcp.Meta{ProgressToken: "p1"}
+	if out := stripHopMeta(progressOnly); out != progressOnly {
+		t.Errorf("meta without additional fields = %#v, want it returned unchanged", out)
+	}
+}
+
+func TestCatalogFilterFuncSemantics(t *testing.T) {
+	t.Parallel()
+
+	allow := func(list ...string) *FilterConfig {
+		return &FilterConfig{Mode: FilterModeAllow, List: list}
+	}
+	block := func(list ...string) *FilterConfig {
+		return &FilterConfig{Mode: FilterModeBlock, List: list}
+	}
+	tests := []struct {
+		name   string
+		filter *FilterConfig
+		keys   []string
+		want   bool
+	}{
+		{name: "nil filter allows", filter: nil, keys: []string{"a"}, want: true},
+		// An empty allow list cannot come from a validated config; a
+		// programmatic one matches nothing and exposes nothing.
+		{name: "empty allow list exposes nothing", filter: allow(), keys: []string{"a"}, want: false},
+		{name: "allow matches first key", filter: allow("uri://a"), keys: []string{"uri://a", "a"}, want: true},
+		{name: "allow matches second key", filter: allow("a"), keys: []string{"uri://a", "a"}, want: true},
+		{name: "allow excludes unlisted", filter: allow("b"), keys: []string{"uri://a", "a"}, want: false},
+		{name: "empty block list allows", filter: block(), keys: []string{"a"}, want: true},
+		{name: "block hides by any key", filter: block("a"), keys: []string{"uri://a", "a"}, want: false},
+		{name: "block keeps unlisted", filter: block("b"), keys: []string{"uri://a", "a"}, want: true},
+		{name: "mode is case-insensitive", filter: &FilterConfig{Mode: "BLOCK", List: []string{"a"}}, keys: []string{"a"}, want: false},
+		{name: "unknown mode fails closed", filter: &FilterConfig{Mode: "nonsense", List: []string{"a"}}, keys: []string{"b"}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resourceFilterFunc("test", &OptionsV2{ResourceFilter: tt.filter})(tt.keys...)
+			if got != tt.want {
+				t.Errorf("resourceFilter = %v, want %v", got, tt.want)
+			}
+			got = promptFilterFunc("test", &OptionsV2{PromptFilter: tt.filter})(tt.keys...)
+			if got != tt.want {
+				t.Errorf("promptFilter = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestToolFilterIgnoresResourceAndPromptFilters(t *testing.T) {
+	t.Parallel()
+
+	options := &OptionsV2{
+		ResourceFilter: &FilterConfig{Mode: FilterModeAllow},
+		PromptFilter:   &FilterConfig{Mode: FilterModeAllow},
+	}
+	if !toolFilterFunc("test", options)("any") {
+		t.Fatal("resourceFilter/promptFilter must not affect tools")
+	}
+	if !resourceFilterFunc("test", &OptionsV2{ToolFilter: &FilterConfig{Mode: FilterModeAllow, List: []string{"x"}}})("any") {
+		t.Fatal("toolFilter must not affect resources")
+	}
+}
+
+func TestResourceAndPromptFiltersApplyToCatalog(t *testing.T) {
+	t.Parallel()
+
+	downstream := newRawDownstream(t)
+	downstream.setTools("alpha")
+	downstream.setPrompts("greet", "internal")
+	downstream.setResources("test://public", "test://secret")
+	downstream.setResourceTemplates(
+		map[string]any{"name": "echo", "uriTemplate": "test://echo/{word}"},
+		map[string]any{"name": "dump", "uriTemplate": "test://dump/{id}"},
+	)
+
+	mcpClient, err := newMCPClient("test", &MCPClientConfigV2{
+		TransportType: MCPClientTypeStreamable,
+		URL:           downstream.url,
+		Options: &OptionsV2{
+			ResourceFilter: &FilterConfig{Mode: FilterModeBlock, List: []string{"test://secret", "dump"}},
+			PromptFilter:   &FilterConfig{Mode: FilterModeAllow, List: []string{"greet"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("newMCPClient: %v", err)
+	}
+	defer func() { _ = mcpClient.Close() }()
+
+	proxyServer := newProxyServerForTest(t)
+	if err := mcpClient.addToMCPServer(t.Context(), mcp.Implementation{Name: "test"}, proxyServer); err != nil {
+		t.Fatalf("addToMCPServer: %v", err)
+	}
+
+	if got := serverListNames(t, proxyServer, "resources/list", "resources", "uri"); !slices.Equal(got, []string{"test://public"}) {
+		t.Errorf("resources = %v, want [test://public]", got)
+	}
+	if got := serverResourceTemplateNames(t, proxyServer); !slices.Equal(got, []string{"echo"}) {
+		t.Errorf("resource templates = %v, want [echo]", got)
+	}
+	if got := serverListNames(t, proxyServer, "prompts/list", "prompts", "name"); !slices.Equal(got, []string{"greet"}) {
+		t.Errorf("prompts = %v, want [greet]", got)
+	}
+}
+
+// A URI hidden by a block list must not be readable through an exposed
+// template that happens to match it, whatever way it is spelled.
+func TestBlockedResourceIsNotReadableThroughTemplate(t *testing.T) {
+	t.Parallel()
+
+	downstream := newRawDownstream(t)
+	downstream.setTools("alpha")
+	downstream.setResources("test://echo/secret", "test://echo/hidden")
+	downstream.setResourceName("test://echo/hidden", "hidden-doc")
+	downstream.setResourceTemplates(
+		map[string]any{"name": "echo", "uriTemplate": "test://echo/{word}"},
+		map[string]any{"name": "dump", "uriTemplate": "test://dump/{id}"},
+	)
+
+	mcpClient, err := newMCPClient("test", &MCPClientConfigV2{
+		TransportType: MCPClientTypeStreamable,
+		URL:           downstream.url,
+		Options: &OptionsV2{
+			ResourceFilter: &FilterConfig{Mode: FilterModeBlock, List: []string{"test://echo/secret", "hidden-doc", "test://dump/{id}"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("newMCPClient: %v", err)
+	}
+	defer func() { _ = mcpClient.Close() }()
+
+	proxyServer := newProxyServerForTest(t)
+	if err := mcpClient.addToMCPServer(t.Context(), mcp.Implementation{Name: "test"}, proxyServer); err != nil {
+		t.Fatalf("addToMCPServer: %v", err)
+	}
+	if got := serverResourceTemplateNames(t, proxyServer); !slices.Equal(got, []string{"echo"}) {
+		t.Fatalf("templates = %v, want [echo] (dump blocked by uriTemplate)", got)
+	}
+
+	// Each spelling must fail. Some are refused by the proxy's check, others
+	// never match the template in mcp-go; either way none may be served.
+	for _, uri := range []string{
+		"test://echo/secret",
+		"test://echo/%73ecret",
+		"test://echo/secret#frag",
+		"TEST://ECHO/secret",
+		"test://echo/hidden", // hidden by name, not by URI
+	} {
+		if msg := readResourceError(t, proxyServer, uri); msg == "" {
+			t.Errorf("read %q was served", uri)
+		}
+	}
+	for _, uri := range []string{"test://echo/secret", "test://echo/%73ecret", "test://echo/hidden"} {
+		if msg := readResourceError(t, proxyServer, uri); !strings.Contains(msg, "not available") {
+			t.Errorf("read %q: error = %q, want the proxy's refusal", uri, msg)
+		}
+	}
+	if msg := readResourceError(t, proxyServer, "test://echo/other"); msg != "" {
+		t.Errorf("read of an unblocked URI failed: %q", msg)
+	}
+}
+
+func TestNormalizeResourceURI(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]string{
+		"test://echo/secret":      "test://echo/secret",
+		"TEST://Echo/Secret":      "test://echo/Secret",
+		"test://echo/%73ecret":    "test://echo/secret",
+		"test://echo/a%2fb":       "test://echo/a%2Fb",
+		"test://echo/x#fragment":  "test://echo/x",
+		"file:///etc/%70asswd":    "file:///etc/passwd",
+		"urn:Example:%7Eitem":     "urn:Example:~item",
+		"no-scheme/path%41":       "no-scheme/pathA",
+		"test://h?q=%41#f":        "test://h?q=A",
+		"test://echo/bad%zzvalue": "test://echo/bad%zzvalue",
+		"test://echo/%7%30ass":    "test://echo/pass",
+	}
+	for in, want := range tests {
+		if got := normalizeResourceURI(in); got != want {
+			t.Errorf("normalizeResourceURI(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// Allow mode exposes a template by name, and with it every URI it matches.
+func TestAllowedTemplateByName(t *testing.T) {
+	t.Parallel()
+
+	downstream := newRawDownstream(t)
+	downstream.setTools("alpha")
+	downstream.setResourceTemplates(
+		map[string]any{"name": "echo", "uriTemplate": "test://echo/{word}"},
+		map[string]any{"name": "dump", "uriTemplate": "test://dump/{id}"},
+	)
+	mcpClient, err := newMCPClient("test", &MCPClientConfigV2{
+		TransportType: MCPClientTypeStreamable,
+		URL:           downstream.url,
+		Options:       &OptionsV2{ResourceFilter: &FilterConfig{Mode: FilterModeAllow, List: []string{"echo"}}},
+	})
+	if err != nil {
+		t.Fatalf("newMCPClient: %v", err)
+	}
+	defer func() { _ = mcpClient.Close() }()
+	proxyServer := newProxyServerForTest(t)
+	if err := mcpClient.addToMCPServer(t.Context(), mcp.Implementation{Name: "test"}, proxyServer); err != nil {
+		t.Fatalf("addToMCPServer: %v", err)
+	}
+	if got := serverResourceTemplateNames(t, proxyServer); !slices.Equal(got, []string{"echo"}) {
+		t.Fatalf("templates = %v, want [echo]", got)
+	}
+	if msg := readResourceError(t, proxyServer, "test://echo/anything"); msg != "" {
+		t.Errorf("read through the allowed template failed: %q", msg)
+	}
+	if msg := readResourceError(t, proxyServer, "test://dump/1"); msg == "" {
+		t.Error("read through a template that is not allowed succeeded")
+	}
+}
+
+// serverListNames reads back one field of every entry a list method returns.
+func serverListNames(t *testing.T, mcpServer *server.MCPServer, method, resultKey, field string) []string {
+	t.Helper()
+
+	resp := mcpServer.HandleMessage(context.Background(), []byte(`{"jsonrpc":"2.0","id":1,"method":"`+method+`","params":{}}`))
+	raw, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("marshal %s response: %v", method, err)
+	}
+	var decoded struct {
+		Result map[string][]map[string]any `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal %s response: %v (%s)", method, err, raw)
+	}
+	names := make([]string, 0)
+	for _, entry := range decoded.Result[resultKey] {
+		if value, ok := entry[field].(string); ok {
+			names = append(names, value)
+		}
+	}
+	slices.Sort(names)
+	return names
+}
+
+// readResourceError performs resources/read on the proxy-side server and
+// returns the JSON-RPC error message, or "" on success.
+func readResourceError(t *testing.T, mcpServer *server.MCPServer, uri string) string {
+	t.Helper()
+
+	request, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": "resources/read",
+		"params": map[string]any{"uri": uri},
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	raw, err := json.Marshal(mcpServer.HandleMessage(context.Background(), request))
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+	var decoded struct {
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if decoded.Error == nil {
+		return ""
+	}
+	return decoded.Error.Message
+}
+
+// An empty allow list cannot come from a validated config; a programmatic one
+// matches nothing, so resources, templates and prompts are all hidden while
+// tools (which have no filter here) still show.
+func TestEmptyAllowListHidesAllResourcesAndPrompts(t *testing.T) {
+	t.Parallel()
+
+	downstream := newRawDownstream(t)
+	downstream.setTools("alpha")
+	downstream.setPrompts("greet")
+	downstream.setResources("test://public")
+	downstream.setResourceTemplates(map[string]any{"name": "echo", "uriTemplate": "test://echo/{word}"})
+
+	mcpClient, err := newMCPClient("test", &MCPClientConfigV2{
+		TransportType: MCPClientTypeStreamable,
+		URL:           downstream.url,
+		Options: &OptionsV2{
+			ResourceFilter: &FilterConfig{Mode: FilterModeAllow},
+			PromptFilter:   &FilterConfig{Mode: FilterModeAllow},
+		},
+	})
+	if err != nil {
+		t.Fatalf("newMCPClient: %v", err)
+	}
+	defer func() { _ = mcpClient.Close() }()
+
+	proxyServer := newProxyServerForTest(t)
+	if err := mcpClient.addToMCPServer(t.Context(), mcp.Implementation{Name: "test"}, proxyServer); err != nil {
+		t.Fatalf("addToMCPServer: %v", err)
+	}
+	if got := serverListNames(t, proxyServer, "resources/list", "resources", "uri"); len(got) != 0 {
+		t.Errorf("resources = %v, want none", got)
+	}
+	if got := serverResourceTemplateNames(t, proxyServer); len(got) != 0 {
+		t.Errorf("resource templates = %v, want none", got)
+	}
+	if got := serverListNames(t, proxyServer, "prompts/list", "prompts", "name"); len(got) != 0 {
+		t.Errorf("prompts = %v, want none", got)
+	}
+	if got := serverToolNames(t, proxyServer); !slices.Equal(got, []string{"alpha"}) {
+		t.Errorf("tools = %v, want [alpha]", got)
+	}
+}
+
+// waitForTools polls the proxy-side tool list until it equals want or ~5s
+// pass; a list_changed notification refreshes asynchronously, so the update
+// cannot be observed synchronously.
+func waitForTools(t *testing.T, mcpServer *server.MCPServer, want []string) []string {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got := serverToolNames(t, mcpServer)
+		if slices.Equal(got, want) {
+			return got
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("tools = %v after 5s, want %v", got, want)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// newListChangedDownstream builds an in-process mcp-go downstream that
+// advertises tools and prompts listChanged but NOT resources listChanged, on
+// the given transport, plus a connected proxy client + proxy server pair.
+func newListChangedDownstream(t *testing.T, transportType string, extraOpts ...server.ServerOption) (*server.MCPServer, *Client, *server.MCPServer) {
+	t.Helper()
+
+	opts := append([]server.ServerOption{
+		server.WithToolCapabilities(true),
+		server.WithPromptCapabilities(true),
+		server.WithResourceCapabilities(true, false),
+	}, extraOpts...)
+	downstream := server.NewMCPServer("downstream", "1.0.0", opts...)
+	downstream.AddTool(mcp.NewTool("alpha"),
+		func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("a"), nil
+		})
+
+	conf := &MCPClientConfigV2{Options: &OptionsV2{}}
+	var httpServer *httptest.Server
+	if transportType == "sse" {
+		conf.TransportType = MCPClientTypeSSE
+		httpServer = httptest.NewServer(server.NewSSEServer(downstream))
+		conf.URL = httpServer.URL + "/sse"
+	} else {
+		conf.TransportType = MCPClientTypeStreamable
+		httpServer = httptest.NewServer(server.NewStreamableHTTPServer(downstream))
+		conf.URL = httpServer.URL + "/mcp"
+	}
+	t.Cleanup(httpServer.Close)
+
+	mcpClient, err := newMCPClient("test", conf)
+	if err != nil {
+		t.Fatalf("newMCPClient: %v", err)
+	}
+	t.Cleanup(func() { _ = mcpClient.Close() })
+
+	proxyServer := newProxyServerForTest(t)
+	if err := mcpClient.addToMCPServer(t.Context(), mcp.Implementation{Name: "test"}, proxyServer); err != nil {
+		t.Fatalf("addToMCPServer: %v", err)
+	}
+	if got := serverToolNames(t, proxyServer); !slices.Equal(got, []string{"alpha"}) {
+		t.Fatalf("initial tools = %v, want [alpha]", got)
+	}
+	return downstream, mcpClient, proxyServer
+}
+
+// A downstream's own list_changed notification must refresh the proxy catalog
+// end to end: over SSE the event stream carries it, and over streamable-http a
+// modern connection receives it on the subscriptions/listen stream the proxy
+// opted in to (mcp-go has broadcast to modern sessions since v1.2.0).
+func TestListChangedRefreshesCatalog(t *testing.T) {
+	t.Parallel()
+
+	for _, transportType := range []string{"sse", "streamable-http"} {
+		t.Run(transportType, func(t *testing.T) {
+			downstream, _, proxyServer := newListChangedDownstream(t, transportType)
+
+			downstream.AddTool(mcp.NewTool("beta"),
+				func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+					return mcp.NewToolResultText("b"), nil
+				})
+			waitForTools(t, proxyServer, []string{"alpha", "beta"})
+		})
+	}
+}
+
+// On a modern (2026-07-28) connection the proxy opts in to list_changed via
+// subscriptions/listen, intersected with the capabilities the downstream
+// advertised: tools and prompts here, not resources.
+func TestModernDownstreamOptsIntoListChanged(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	var filters []mcp.SubscriptionFilter
+	hooks := &server.Hooks{}
+	hooks.AddBeforeAny(func(ctx context.Context, id any, method mcp.MCPMethod, message any) {
+		if method != mcp.MethodSubscriptionsListen {
+			return
+		}
+		request, ok := message.(*mcp.SubscriptionsListenRequest)
+		if !ok {
+			return
+		}
+		mu.Lock()
+		filters = append(filters, request.Params.Notifications)
+		mu.Unlock()
+	})
+
+	_, _, _ = newListChangedDownstream(t, "streamable-http", server.WithHooks(hooks))
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		got := slices.Clone(filters)
+		mu.Unlock()
+		if len(got) > 0 {
+			filter := got[len(got)-1]
+			if !filter.ToolsListChanged || !filter.PromptsListChanged ||
+				filter.ResourcesListChanged || len(filter.ResourceSubscriptions) > 0 {
+				t.Fatalf("subscriptions/listen filter = %+v, want only tools+prompts list_changed", filter)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("downstream received no subscriptions/listen within 5s")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// On a modern streamable-http connection the downstream's list_changed must
+// refresh the proxy catalog; the notification a compliant downstream would
+// push is injected here to exercise the dispatch path directly. Real delivery
+// over subscriptions/listen is covered by TestListChangedRefreshesCatalog.
+func TestListChangedNotificationRefreshesCatalog(t *testing.T) {
+	t.Parallel()
+
+	downstream, mcpClient, proxyServer := newListChangedDownstream(t, "streamable-http")
+
+	downstream.AddTool(mcp.NewTool("beta"),
+		func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("b"), nil
+		})
+	mcpClient.onDownstreamNotification(mcpClient.getClient(), mcp.JSONRPCNotification{
+		Notification: mcp.Notification{Method: string(mcp.MethodNotificationToolsListChanged)},
+	})
+	waitForTools(t, proxyServer, []string{"alpha", "beta"})
+}
+
+// A notification arriving on a transport that is no longer the live one (e.g.
+// a retired connection draining in-flight requests) must not refresh.
+func TestListChangedOnNonLiveClientIsIgnored(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	listCalls := 0
+	hooks := &server.Hooks{}
+	hooks.AddBeforeAny(func(ctx context.Context, id any, method mcp.MCPMethod, message any) {
+		if method == mcp.MethodToolsList {
+			mu.Lock()
+			listCalls++
+			mu.Unlock()
+		}
+	})
+	toolsListCalls := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return listCalls
+	}
+	downstream := server.NewMCPServer("downstream", "1.0.0",
+		server.WithToolCapabilities(true), server.WithHooks(hooks))
+	downstream.AddTool(mcp.NewTool("alpha"),
+		func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("a"), nil
+		})
+	httpServer := httptest.NewServer(server.NewStreamableHTTPServer(downstream))
+	t.Cleanup(httpServer.Close)
+
+	mcpClient, err := newMCPClient("test", &MCPClientConfigV2{
+		TransportType: MCPClientTypeStreamable,
+		URL:           httpServer.URL + "/mcp",
+		Options:       &OptionsV2{},
+	})
+	if err != nil {
+		t.Fatalf("newMCPClient: %v", err)
+	}
+	defer func() { _ = mcpClient.Close() }()
+
+	proxyServer := newProxyServerForTest(t)
+	if err := mcpClient.addToMCPServer(t.Context(), mcp.Implementation{Name: "test"}, proxyServer); err != nil {
+		t.Fatalf("addToMCPServer: %v", err)
+	}
+
+	other, err := newRawClient("test", &StreamableMCPClientConfig{URL: httpServer.URL + "/mcp"})
+	if err != nil {
+		t.Fatalf("newRawClient: %v", err)
+	}
+	defer func() { _ = other.Close() }()
+
+	// A notification attributed to the non-live transport must be dropped
+	// before it can trigger a re-list at all.
+	before := toolsListCalls()
+	mcpClient.onDownstreamNotification(other, mcp.JSONRPCNotification{
+		Notification: mcp.Notification{Method: string(mcp.MethodNotificationToolsListChanged)},
+	})
+	time.Sleep(300 * time.Millisecond)
+	if got := toolsListCalls(); got != before {
+		t.Fatalf("stale notification triggered %d tools/list call(s)", got-before)
+	}
+	// Sanity: a notification on the live transport does trigger a re-list.
+	mcpClient.onDownstreamNotification(mcpClient.getClient(), mcp.JSONRPCNotification{
+		Notification: mcp.Notification{Method: string(mcp.MethodNotificationToolsListChanged)},
+	})
+	deadline := time.Now().Add(5 * time.Second)
+	for toolsListCalls() == before {
+		if time.Now().After(deadline) {
+			t.Fatal("live notification did not re-list tools within 5s")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }

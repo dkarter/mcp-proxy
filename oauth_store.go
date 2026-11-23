@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/mark3labs/mcp-go/client/transport"
 )
@@ -48,6 +49,12 @@ func oauthStorageName(serverName string) (string, error) {
 // oauthTokenPath returns the on-disk path for a server's token file,
 // rooted under the user's config dir (~/.config/mcp-proxy/oauth on Linux).
 func oauthTokenPath(serverName string) (string, error) {
+	return oauthPath(serverName, ".json")
+}
+
+// oauthPath resolves the on-disk path for a server's OAuth storage file,
+// rooted under the user's config dir (~/.config/mcp-proxy/oauth on Linux).
+func oauthPath(serverName, suffix string) (string, error) {
 	dir, err := os.UserConfigDir()
 	if err != nil {
 		return "", fmt.Errorf("failed to determine user config dir: %w", err)
@@ -56,7 +63,7 @@ func oauthTokenPath(serverName string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, "mcp-proxy", "oauth", storageName+".json"), nil
+	return filepath.Join(dir, "mcp-proxy", "oauth", storageName+suffix), nil
 }
 
 func (s *FileTokenStore) GetToken(ctx context.Context) (*transport.Token, error) {
@@ -78,11 +85,7 @@ func (s *FileTokenStore) GetToken(ctx context.Context) (*transport.Token, error)
 		return nil, fmt.Errorf("failed to parse token file %s: %w", s.path, err)
 	}
 	// A token file with no access token and no refresh token is not a usable
-	// credential. This also covers the legacy storage collision: a server
-	// "<name>.client" shares its token path with "<name>"'s pre-fix
-	// client-credentials file, whose JSON unmarshals into an all-zero token.
-	// Reporting ErrNoToken is accurate there and lets the daemon ask for
-	// authorization instead of treating a foreign file as a token.
+	// credential.
 	if token.AccessToken == "" && token.RefreshToken == "" {
 		return nil, transport.ErrNoToken
 	}
@@ -155,124 +158,65 @@ func writePrivateJSON(path string, value any) error {
 type registeredClient struct {
 	ClientID     string `json:"clientId"`
 	ClientSecret string `json:"clientSecret,omitempty"`
+	// RedirectURI is the redirect URI the client was registered with. Files
+	// written before it was recorded have none.
+	RedirectURI string `json:"redirectUri,omitempty"`
 }
 
-// oauthClientStorageSuffix separates a server's registered-client file from its
-// token file. It used to be ".client", appended to the same storage name, which
-// made "<name>" and "<name>.client" resolve to one file: the token file of the
-// latter was the client-credentials file of the former, so each write replaced
-// the other's schema and both routes broke. "@" cannot appear in an
-// oauthStorageName result (safe names allow only [A-Za-z0-9._-], anything else
-// becomes "server-<hex>"), so the two namespaces can no longer collide.
+// oauthClientStorageSuffix separates a server's registered-client file from
+// its token file. "@" cannot appear in an oauthStorageName result (safe names
+// allow only [A-Za-z0-9._-], anything else becomes "server-<hex>"), so one
+// server's token file can never alias another server's client file.
 const oauthClientStorageSuffix = "@client.json"
-
-// oauthLegacyClientStorageSuffix is the pre-fix suffix. Writes use the new name
-// above, but reads still fall back to this one so a client registered by an
-// earlier version keeps working.
-const oauthLegacyClientStorageSuffix = ".client.json"
 
 // oauthClientPath returns the on-disk path for a server's registered OAuth
 // client credentials, alongside its token file.
 func oauthClientPath(serverName string) (string, error) {
-	dir, err := os.UserConfigDir()
-	if err != nil {
-		return "", fmt.Errorf("failed to determine user config dir: %w", err)
-	}
-	storageName, err := oauthStorageName(serverName)
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "mcp-proxy", "oauth", storageName+oauthClientStorageSuffix), nil
+	return oauthPath(serverName, oauthClientStorageSuffix)
 }
 
 // loadRegisteredClient returns (clientID, clientSecret, true) if a
 // previously dynamically-registered client was persisted for this server,
 // or ("", "", false) if none exists yet.
-//
-// It also reads the pre-fix ".client.json" name so a client registered by an
-// earlier version keeps working. That legacy path is also the token path of a
-// server named "<name>.client", so a legacy read only counts when the file
-// actually contains a clientId (see below).
 func loadRegisteredClient(serverName string) (string, string, bool, error) {
+	rc, ok, err := readRegisteredClient(serverName)
+	return rc.ClientID, rc.ClientSecret, ok, err
+}
+
+// readRegisteredClient returns the whole persisted registration, including
+// the redirect URI it was made with.
+func readRegisteredClient(serverName string) (registeredClient, bool, error) {
 	path, err := oauthClientPath(serverName)
 	if err != nil {
-		return "", "", false, err
+		return registeredClient{}, false, err
 	}
 	data, err := os.ReadFile(path)
-	if err == nil {
-		return parseRegisteredClient(path, data)
+	if errors.Is(err, os.ErrNotExist) {
+		return registeredClient{}, false, nil
 	}
-	if !errors.Is(err, os.ErrNotExist) {
-		return "", "", false, fmt.Errorf("failed to read client file %s: %w", path, err)
-	}
-	legacyPath, legacyErr := oauthLegacyClientPath(serverName)
-	if legacyErr != nil {
-		return "", "", false, nil
-	}
-	legacyData, readErr := os.ReadFile(legacyPath)
-	if readErr != nil {
-		return "", "", false, nil
-	}
-	// The legacy leaf of "X" ("X.client.json") is the same path as the token
-	// file of a server named "X.client", so the path alone cannot say which
-	// server the file belongs to. A token file is not a client registration:
-	// ignoring it keeps the two names independent instead of failing with a
-	// confusing clientId error. A file that is neither is left to the normal
-	// parser, so a corrupt client file still reports why.
-	if looksLikeTokenFile(legacyData) {
-		return "", "", false, nil
-	}
-	return parseRegisteredClient(legacyPath, legacyData)
-}
-
-// looksLikeTokenFile reports whether data is an OAuth token document rather than
-// a registered-client document. It is deliberately shape-based (field presence,
-// not values) so a client registration with an unexpected extra field is not
-// misclassified.
-func looksLikeTokenFile(data []byte) bool {
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(data, &fields); err != nil {
-		return false
-	}
-	if _, isClient := fields["clientId"]; isClient {
-		return false
-	}
-	for _, key := range []string{"access_token", "refresh_token", "token_type"} {
-		if _, ok := fields[key]; ok {
-			return true
-		}
-	}
-	return false
-}
-
-// oauthLegacyClientPath is the pre-fix client-credentials path, read only.
-func oauthLegacyClientPath(serverName string) (string, error) {
-	dir, err := os.UserConfigDir()
 	if err != nil {
-		return "", fmt.Errorf("failed to determine user config dir: %w", err)
+		return registeredClient{}, false, fmt.Errorf("failed to read client file %s: %w", path, err)
 	}
-	storageName, err := oauthStorageName(serverName)
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "mcp-proxy", "oauth", storageName+oauthLegacyClientStorageSuffix), nil
+	return parseRegisteredClient(path, data)
 }
 
-func parseRegisteredClient(path string, data []byte) (string, string, bool, error) {
+func parseRegisteredClient(path string, data []byte) (registeredClient, bool, error) {
 	var rc registeredClient
 	if err := json.Unmarshal(data, &rc); err != nil {
-		return "", "", false, fmt.Errorf("failed to parse client file %s: %w", path, err)
+		return registeredClient{}, false, fmt.Errorf("failed to parse client file %s: %w", path, err)
 	}
 	if rc.ClientID == "" {
-		return "", "", false, fmt.Errorf("client file %s does not contain a clientId", path)
+		return registeredClient{}, false, fmt.Errorf("client file %s does not contain a clientId", path)
 	}
-	return rc.ClientID, rc.ClientSecret, true, nil
+	return rc, true, nil
 }
 
 // saveRegisteredClient persists a dynamically-registered client's
 // credentials so future daemon starts (and re-authorizations) reuse the
-// same registration instead of getting an empty ClientID.
-func saveRegisteredClient(serverName, clientID, clientSecret string) error {
+// same registration instead of getting an empty ClientID. redirectURI is the
+// one it was registered with, so a later -authorize can tell when the config
+// has moved on from it.
+func saveRegisteredClient(serverName, clientID, clientSecret, redirectURI string) error {
 	path, err := oauthClientPath(serverName)
 	if err != nil {
 		return err
@@ -280,5 +224,39 @@ func saveRegisteredClient(serverName, clientID, clientSecret string) error {
 	if clientID == "" {
 		return errors.New("cannot save an empty OAuth clientId")
 	}
-	return writePrivateJSON(path, registeredClient{ClientID: clientID, ClientSecret: clientSecret})
+	return writePrivateJSON(path, registeredClient{ClientID: clientID, ClientSecret: clientSecret, RedirectURI: redirectURI})
+}
+
+// tokenRefreshLeeway is how long before its recorded expiry an access token is
+// treated as expired, so mcp-go refreshes it ahead of time.
+//
+// mcp-go compares ExpiresAt with time.Now() and nothing else. A token is then
+// sent until the very instant it expires, and a request that leaves just
+// before that instant reaches the server after it: the server answers 401 and
+// the call fails with "no valid token available, authorization required".
+// The keepalive probe hits this on every rotation, because the refresh happens
+// on a probe tick and expires_in is usually a multiple of the probe interval
+// (900s / 30s), so the next expiry lands on a tick again.
+const tokenRefreshLeeway = 60 * time.Second
+
+// earlyRefreshTokenStore reports tokens as expiring tokenRefreshLeeway early
+// (at most a tenth of their lifetime, so a short-lived token is not refreshed
+// on every request). Only the copy handed to the OAuth handler is shifted;
+// the stored token, which -auth-status displays, keeps its real expiry.
+type earlyRefreshTokenStore struct {
+	transport.TokenStore
+}
+
+func (s earlyRefreshTokenStore) GetToken(ctx context.Context) (*transport.Token, error) {
+	token, err := s.TokenStore.GetToken(ctx)
+	if err != nil || token == nil || token.ExpiresAt.IsZero() {
+		return token, err
+	}
+	leeway := tokenRefreshLeeway
+	if token.ExpiresIn > 0 {
+		leeway = min(leeway, time.Duration(token.ExpiresIn)*time.Second/10)
+	}
+	shifted := *token
+	shifted.ExpiresAt = token.ExpiresAt.Add(-leeway)
+	return &shifted, nil
 }

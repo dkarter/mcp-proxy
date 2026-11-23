@@ -21,11 +21,9 @@ import (
 	"github.com/tbxark/optional-go"
 )
 
-// Duration is a time.Duration that also accepts a JSON string like "30s". A
-// bare JSON number still means nanoseconds, which is what decoding into a
-// time.Duration has always done here, but that reads as seconds to almost
-// everyone - so validation rejects the sub-millisecond values that mistake
-// produces.
+// Duration is a time.Duration decoded from a JSON string like "30s". A bare
+// JSON number is rejected rather than read as nanoseconds: it reads as seconds
+// to almost everyone, and a bare 30 used to silently become 30 nanoseconds.
 type Duration time.Duration
 
 func (d *Duration) UnmarshalJSON(data []byte) error {
@@ -40,14 +38,10 @@ func (d *Duration) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("invalid duration %q: %w", v, err)
 		}
 		*d = Duration(parsed)
-	case float64:
-		*d = Duration(v)
 	case nil:
 		// An explicit null means "unset", exactly like leaving the key out.
-		// Decoding into a plain time.Duration used to ignore it, so failing
-		// here would reject configs that have always loaded.
 	default:
-		return fmt.Errorf(`duration must be a string like "30s" or a number of nanoseconds, got %s`, data)
+		return fmt.Errorf(`duration must be a string like "30s", got %s`, data)
 	}
 	return nil
 }
@@ -98,6 +92,17 @@ type OAuthClientConfig struct {
 	// some providers (e.g. Datadog) only serve it at the RFC 8414
 	// location.
 	AuthServerMetadataURL string `json:"authServerMetadataUrl,omitempty"`
+	// CallbackListen is the loopback host:port the callback listener binds
+	// to, for when RedirectURI is not the listener's own address but one a
+	// reverse proxy on the same host serves and forwards here. Empty keeps
+	// the default, where the listener binds to the host and port of
+	// RedirectURI.
+	CallbackListen string `json:"callbackListen,omitempty"`
+
+	// ignoreSavedClient makes buildOAuthConfig leave out the dynamically
+	// registered client saved on disk. -authorize sets it when that client
+	// has to be replaced. It is not part of the config schema.
+	ignoreSavedClient bool
 }
 
 const defaultOAuthRedirectURI = "http://localhost:8090/oauth/callback"
@@ -177,24 +182,34 @@ const (
 
 // ---- V2 ----
 
-type ToolFilterMode string
+// FilterMode selects how a FilterConfig's list is applied.
+type FilterMode string
 
 const (
-	ToolFilterModeAllow ToolFilterMode = "allow"
-	ToolFilterModeBlock ToolFilterMode = "block"
+	FilterModeAllow FilterMode = "allow"
+	FilterModeBlock FilterMode = "block"
 )
 
-type ToolFilterConfig struct {
-	Mode ToolFilterMode `json:"mode,omitempty"`
-	List []string       `json:"list,omitempty"`
+// FilterConfig is the allow/block list shape shared by toolFilter,
+// resourceFilter and promptFilter.
+type FilterConfig struct {
+	Mode FilterMode `json:"mode,omitempty"`
+	List []string   `json:"list,omitempty"`
 }
 
 type OptionsV2 struct {
 	PanicIfInvalid optional.Field[bool] `json:"panicIfInvalid"`
 	LogEnabled     optional.Field[bool] `json:"logEnabled"`
 	AuthTokens     []string             `json:"authTokens,omitempty"`
-	ToolFilter     *ToolFilterConfig    `json:"toolFilter,omitempty"`
-	Disabled       bool                 `json:"disabled,omitempty"`
+	ToolFilter     *FilterConfig        `json:"toolFilter,omitempty"`
+	// ResourceFilter selects which resources and resource templates are
+	// exposed. List entries match a resource's URI or name, or a template's
+	// uriTemplate or name.
+	ResourceFilter *FilterConfig `json:"resourceFilter,omitempty"`
+	// PromptFilter selects which prompts are exposed, by prompt name, with
+	// the same semantics as ResourceFilter.
+	PromptFilter *FilterConfig `json:"promptFilter,omitempty"`
+	Disabled     bool          `json:"disabled,omitempty"`
 	// PingInterval is how often this connection is probed to keep it alive and
 	// to notice that it died; it sets how quickly /_readyz reports degraded.
 	PingInterval Duration `json:"pingInterval,omitempty"`
@@ -253,7 +268,7 @@ func parseMCPClientConfigV2(conf *MCPClientConfigV2) (any, error) {
 		case conf.Command != "":
 			transportType = MCPClientTypeStdio
 		case conf.URL != "":
-			transportType = MCPClientTypeSSE
+			transportType = MCPClientTypeStreamable
 		default:
 			return nil, errors.New("command or url is required")
 		}
@@ -270,19 +285,14 @@ func parseMCPClientConfigV2(conf *MCPClientConfigV2) (any, error) {
 		if conf.OAuth != nil {
 			return nil, errors.New("oauth is not supported for stdio transport")
 		}
-		// A sub-millisecond timeout is almost always a bare number copied in
-		// from a Claude config, where it means nanoseconds. Such a value is
-		// discarded rather than failing startup — the historical behaviour for
-		// stdio — but a usable one now bounds each request.
-		stdioTimeout := conf.Timeout
-		if err := validateDuration("timeout", stdioTimeout); err != nil {
-			stdioTimeout = 0
+		if err := validateDuration("timeout", conf.Timeout); err != nil {
+			return nil, err
 		}
 		return &StdioMCPClientConfig{
 			Command: conf.Command,
 			Env:     conf.Env,
 			Args:    conf.Args,
-			Timeout: stdioTimeout,
+			Timeout: conf.Timeout,
 		}, nil
 	case MCPClientTypeSSE:
 		if conf.URL == "" {
@@ -315,15 +325,10 @@ func parseMCPClientConfigV2(conf *MCPClientConfigV2) (any, error) {
 	}
 }
 
-// validateDuration rejects the values a bare JSON number produces when the
-// author meant seconds: 30 decodes to 30 nanoseconds, which used to fail every
-// request with an unhelpful deadline error.
+// validateDuration rejects negative durations; everything else is valid.
 func validateDuration(field string, d Duration) error {
 	if d < 0 {
 		return fmt.Errorf("%s cannot be negative", field)
-	}
-	if d > 0 && time.Duration(d) < time.Millisecond {
-		return fmt.Errorf(`%s %v is shorter than a millisecond; a bare number means nanoseconds, write a string like "30s" instead`, field, time.Duration(d))
 	}
 	return nil
 }
@@ -331,11 +336,11 @@ func validateDuration(field string, d Duration) error {
 func validateHTTPURL(field, rawURL string) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		// Keep the original "is invalid" wording for compatibility, but do not
-		// echo the URL or the parser's reason. net/url truncates a malformed URL
-		// at the first '#', after which a credential can look like a port
-		// ("https://user:SECRET#frag@h/p" yields `invalid port ":SECRET"`), so
-		// neither the URL nor the reason can be redacted reliably.
+		// Do not echo the URL or the parser's reason. net/url truncates a
+		// malformed URL at the first '#', after which a credential can look
+		// like a port ("https://user:SECRET#frag@h/p" yields `invalid port
+		// ":SECRET"`), so neither the URL nor the reason can be redacted
+		// reliably.
 		return fmt.Errorf("%s is invalid: the value is not a parseable URL", field)
 	}
 	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
@@ -359,16 +364,31 @@ func validateOptions(field string, options *OptionsV2) error {
 			return fmt.Errorf("%s.authTokens[%d] cannot be empty", field, i)
 		}
 	}
-	if options.ToolFilter == nil {
+	if err := validateFilter(field+".toolFilter", options.ToolFilter); err != nil {
+		return err
+	}
+	if err := validateFilter(field+".resourceFilter", options.ResourceFilter); err != nil {
+		return err
+	}
+	return validateFilter(field+".promptFilter", options.PromptFilter)
+}
+
+// validateFilter checks one allow/block list. A nil filter is valid and means
+// "no filtering".
+func validateFilter(field string, filter *FilterConfig) error {
+	if filter == nil {
 		return nil
 	}
-	mode := ToolFilterMode(strings.ToLower(string(options.ToolFilter.Mode)))
-	if mode != ToolFilterModeAllow && mode != ToolFilterModeBlock {
-		return fmt.Errorf("%s.toolFilter.mode must be %q or %q", field, ToolFilterModeAllow, ToolFilterModeBlock)
+	mode := FilterMode(strings.ToLower(string(filter.Mode)))
+	if mode != FilterModeAllow && mode != FilterModeBlock {
+		return fmt.Errorf("%s.mode must be %q or %q", field, FilterModeAllow, FilterModeBlock)
 	}
-	for i, toolName := range options.ToolFilter.List {
-		if strings.TrimSpace(toolName) == "" {
-			return fmt.Errorf("%s.toolFilter.list[%d] cannot be empty", field, i)
+	if mode == FilterModeAllow && len(filter.List) == 0 {
+		return fmt.Errorf("%s.list cannot be empty in allow mode", field)
+	}
+	for i, name := range filter.List {
+		if strings.TrimSpace(name) == "" {
+			return fmt.Errorf("%s.list[%d] cannot be empty", field, i)
 		}
 	}
 	return nil
@@ -435,6 +455,9 @@ func validateConfig(config *Config) error {
 	if err := validateDuration("mcpProxy.startupGracePeriod", proxy.StartupGracePeriod); err != nil {
 		return err
 	}
+	if proxy.Options != nil && proxy.Options.Disabled {
+		return errors.New("mcpProxy.options.disabled is only valid per server")
+	}
 	if err := validateOptions("mcpProxy.options", proxy.Options); err != nil {
 		return err
 	}
@@ -471,11 +494,20 @@ func validateConfig(config *Config) error {
 			if serverConfig.OAuth.ClientID == "" && serverConfig.OAuth.ClientSecret != "" {
 				return fmt.Errorf("%s.oauth.clientSecret requires clientId", field)
 			}
+			callbackListen := serverConfig.OAuth.CallbackListen
+			if callbackListen != "" {
+				if serverConfig.OAuth.RedirectURI == "" {
+					return fmt.Errorf("%s.oauth.callbackListen requires redirectUri", field)
+				}
+				if _, err := parseCallbackListen(callbackListen); err != nil {
+					return fmt.Errorf("%s.oauth.callbackListen: %w", field, err)
+				}
+			}
 			redirectURI := serverConfig.OAuth.RedirectURI
 			if redirectURI == "" {
 				redirectURI = defaultOAuthRedirectURI
 			}
-			if _, _, err := parseRedirectURI(redirectURI); err != nil {
+			if _, _, err := parseRedirectURI(redirectURI, callbackListen != ""); err != nil {
 				return fmt.Errorf("%s.oauth.redirectUri: %w", field, err)
 			}
 			if metadataURL := serverConfig.OAuth.AuthServerMetadataURL; metadataURL != "" {
@@ -493,23 +525,6 @@ func validateConfig(config *Config) error {
 type Config struct {
 	McpProxy   *MCPProxyConfigV2             `json:"mcpProxy"`
 	McpServers map[string]*MCPClientConfigV2 `json:"mcpServers"`
-}
-
-// FullConfig is the on-the-wire shape: Config plus the two keys of the removed
-// v1 schema, kept only so that loading a v1 file fails with a migration hint
-// instead of the misleading "mcpProxy is required".
-type FullConfig struct {
-	LegacyServerV1  json.RawMessage `json:"server"`
-	LegacyClientsV1 json.RawMessage `json:"clients"`
-
-	McpProxy   *MCPProxyConfigV2             `json:"mcpProxy"`
-	McpServers map[string]*MCPClientConfigV2 `json:"mcpServers"`
-}
-
-// jsonPresent reports whether a key was in the document with a value other
-// than null.
-func jsonPresent(raw json.RawMessage) bool {
-	return len(raw) > 0 && string(raw) != "null"
 }
 
 func newConfProvider(path string, insecure, expandEnv bool, httpHeaders string, httpTimeout int) (provider.Provider, error) {
@@ -566,12 +581,9 @@ func load(path string, insecure, expandEnv bool, httpHeaders string, httpTimeout
 	if err != nil {
 		return nil, err
 	}
-	conf, err := confstore.Load[FullConfig](pro, codec.JsonCodec())
+	conf, err := confstore.Load[Config](pro, codec.JsonCodec())
 	if err != nil {
 		return nil, err
-	}
-	if jsonPresent(conf.LegacyServerV1) || jsonPresent(conf.LegacyClientsV1) {
-		return nil, errors.New(`this looks like a v1 config: the "server" and "clients" keys were removed. Rename them to "mcpProxy" and "mcpServers", and lift each client's "config" object into the server entry itself (see docs/CONFIGURATION.md)`)
 	}
 
 	if conf.McpProxy == nil {
@@ -605,10 +617,19 @@ func load(path string, insecure, expandEnv bool, httpHeaders string, httpTimeout
 		if clientConfig.Options.ReconnectInterval == 0 {
 			clientConfig.Options.ReconnectInterval = conf.McpProxy.Options.ReconnectInterval
 		}
+		if clientConfig.Options.ToolFilter == nil {
+			clientConfig.Options.ToolFilter = conf.McpProxy.Options.ToolFilter
+		}
+		if clientConfig.Options.ResourceFilter == nil {
+			clientConfig.Options.ResourceFilter = conf.McpProxy.Options.ResourceFilter
+		}
+		if clientConfig.Options.PromptFilter == nil {
+			clientConfig.Options.PromptFilter = conf.McpProxy.Options.PromptFilter
+		}
 	}
 
 	if conf.McpProxy.Type == "" {
-		conf.McpProxy.Type = MCPServerTypeSSE // default to SSE
+		conf.McpProxy.Type = MCPServerTypeStreamable // default to streamable-http
 	}
 
 	config := &Config{

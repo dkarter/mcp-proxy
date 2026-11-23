@@ -1,22 +1,6 @@
 # Configuration
 
-This project uses the v2 JSON configuration below. The v1 schema (top-level
-`server` and `clients` keys) has been removed: rename them to `mcpProxy` and
-`mcpServers`, and lift each client's `config` object into the server entry
-itself, so that
-
-```jsonc
-{"clients": {"fetch": {"type": "stdio", "config": {"command": "uvx", "args": ["mcp-server-fetch"]}}}}
-```
-
-becomes
-
-```jsonc
-{"mcpServers": {"fetch": {"command": "uvx", "args": ["mcp-server-fetch"]}}}
-```
-
-`panicIfInvalid`, `logEnabled` and `authTokens` move into the entry's `options`,
-and the proxy's `globalAuthTokens` become `mcpProxy.options.authTokens`.
+This project uses the JSON configuration below.
 
 - Online converter (build Claude config from your proxy): https://tbxark.github.io/mcp-proxy
 
@@ -29,7 +13,7 @@ and the proxy's `globalAuthTokens` become `mcpProxy.options.authTokens`.
     "addr": ":9090",
     "name": "MCP Proxy",
     "version": "1.0.0",
-    "type": "streamable-http", // or "sse" (default)
+    "type": "streamable-http", // (default) or "sse"
     "options": {
       "panicIfInvalid": false,
       "logEnabled": true,
@@ -46,6 +30,15 @@ and the proxy's `globalAuthTokens` become `mcpProxy.options.authTokens`.
         "toolFilter": {
           "mode": "block",
           "list": ["create_or_update_file"]
+        },
+        "resourceFilter": {
+          "mode": "allow",
+          // a template and a concrete resource; every other resource is hidden
+          "list": ["repo://{owner}/{repo}/contents{/path*}", "repo://README"]
+        },
+        "promptFilter": {
+          "mode": "block",
+          "list": ["issue_triage"]
         }
       }
     },
@@ -61,12 +54,9 @@ and the proxy's `globalAuthTokens` become `mcpProxy.options.authTokens`.
       }
     },
     "amap": {
-      // SSE client
-      "url": "https://mcp.amap.com/sse",
-      "headers": { "Authorization": "Bearer <YOUR_TOKEN>" },
-      "options": {
-        "disabled": true
-      }
+      // SSE client with the token in the URL query (amap only accepts a key this way)
+      "transportType": "sse",
+      "url": "https://mcp.amap.com/sse?key=<YOUR_TOKEN>"
     },
     "notion": {
       // streamable-http client requiring interactive OAuth (no static
@@ -86,7 +76,7 @@ and the proxy's `globalAuthTokens` become `mcpProxy.options.authTokens`.
 - `baseURL`: Public URL base used to build client endpoints.
 - `addr`: Bind address (e.g. `:9090`).
 - `name`, `version`: Server identity for MCP handshake.
-- `type`: `sse` (default) or `streamable-http`.
+- `type`: `streamable-http` (default) or `sse`.
 - `options`: Defaults inherited by `mcpServers.*.options` (can be overridden per server).
 - `startupGracePeriod` (duration string, default `"30s"`): how long `/_readyz` reports
   `initializing` while clients are still connecting. After it, the proxy reports ready
@@ -104,8 +94,8 @@ or contain `\`, `{`, `}` or control characters. Multiple segments are allowed
 Each entry defines a downstream MCP server. Supported client types:
 
 - `stdio` (implicit when `command` is set): run a subprocess via stdio.
-- `sse` (implicit when `url` is set and `transportType` ≠ `streamable-http`): connect via Server‑Sent Events.
-- `streamable-http` (requires `transportType: "streamable-http"`): connect via HTTP streaming.
+- `streamable-http` (implicit when `url` is set and `transportType` ≠ `sse`): connect via HTTP streaming.
+- `sse` (requires `transportType: "sse"`): connect via Server‑Sent Events.
 
 Common fields:
 
@@ -116,11 +106,9 @@ Common fields:
   credentials from the error messages and logs it controls, but a preference for
   headers avoids relying on that and keeps tokens out of access logs.
 - `timeout` — request timeout for a single downstream request. Write it as a
-  duration string: `"timeout": "30s"`. A bare number means **nanoseconds**
-  (`"timeout": 30` is 30ns, not 30 seconds), so anything under a millisecond is
-  rejected at startup rather than silently failing every request — except on
-  `stdio`, where such a value is discarded and the server runs unbounded, so a
-  timeout copied in from a Claude config cannot break startup.
+  duration string: `"timeout": "30s"`. A bare number is rejected — the same
+  rule applies on `stdio` — because it reads as seconds to most people while
+  decoding as nanoseconds.
   On `stdio` a timeout is worth setting: one pipe carries every request, so a
   request the server accepts and never answers keeps that pipe busy, the
   keepalive probe stops getting replies, and the whole downstream is dropped as
@@ -128,6 +116,17 @@ Common fields:
   resource reads, and prompt fetches alike.
 - `oauth` — for `sse` and `streamable-http` clients that require interactive OAuth instead of (or in addition to) `headers` (see below).
 - `options` — per‑server overrides and filters (see below).
+
+When a downstream server announces that its tools, prompts, or resources
+changed (`notifications/*/list_changed`), the proxy re-lists and re-publishes
+that server's catalog, so downstream changes are picked up live without a
+restart. Two limitations apply: a legacy `streamable-http` downstream only
+delivers notifications that ride on an in-flight request's response stream,
+and mcp-go-based downstreams older than v1.2.0 never send list_changed to
+modern streamable sessions, so for those the catalog still only refreshes on
+reconnect. Progress and logging
+notifications, and server-initiated sampling, elicitation, and roots requests,
+are not forwarded.
 
 ## oauth
 
@@ -142,8 +141,16 @@ as the OAuth client on the downstream connection:
 - `redirectUri` (optional): local callback URL used during the one-time
   interactive authorization. Defaults to `http://localhost:8090/oauth/callback`.
   It must use `http`, a loopback host (`localhost`, `127.0.0.1`, or `::1`), an
-  explicit port, and a non-root callback path. The callback listener never
-  binds to a public interface.
+  explicit port, and a non-root callback path (see `callbackListen` for a
+  public `https` URL). The callback listener never binds to a public
+  interface.
+- `callbackListen` (optional): loopback `host:port` the callback listener
+  binds to, instead of the host and port of `redirectUri`. For a machine
+  without a browser, such as a headless server. `redirectUri` is then
+  required, and may also be an `https` URL on any host, with or without a
+  port: a reverse proxy on the same machine serves it and forwards the
+  callback path, unchanged, to `callbackListen`. See
+  [USAGE.md](USAGE.md#authorizing-on-a-machine-without-a-browser).
 - `scopes` (optional): OAuth scopes to request.
 - `pkceDisabled` (bool, optional): disable PKCE. PKCE is enabled by default.
 - `authServerMetadataUrl` (optional): override discovery of the authorization
@@ -172,8 +179,13 @@ process, so without persisting it, a freshly started daemon would build a
 new OAuth handler with an empty client ID and every token refresh would
 silently be rejected by the provider once the access token expires -
 looking, from the logs, like a refresh failure with no obvious cause.
-(Releases before this used `<server>.client.json`; that name is still read as a
-fallback, so an existing registration keeps working.)
+
+The client is registered for one `redirectUri`, which is saved with it. The
+provider refuses a sign-in that uses the client with any other, and it does so
+in the browser, where `-authorize` only sees a timeout. So when `redirectUri`
+has changed, or the client was saved by a version that did not record it yet,
+`-authorize` signs in with a newly registered client, and saves it in place of
+the old one once the sign-in is approved.
 
 ## options
 
@@ -181,16 +193,30 @@ fallback, so an existing registration keeps working.)
 - `pingInterval` (duration string, default `"30s"`): how often the connection is probed
   to keep it alive and to notice it died. This is how quickly `/_readyz` turns
   `degraded` after a downstream goes away.
-- `logEnabled` (bool): Log requests and events for this client.
-- `authTokens` ([]string): Valid bearer tokens; requests must include `Authorization: <token>`.
+- `logEnabled` (bool): Log each incoming HTTP request (method and path) for this server.
+- `authTokens` ([]string): Valid bearer tokens; requests must include
+  `Authorization: Bearer <token>` (a bare token is also accepted).
 - `toolFilter` (object): Selectively expose tools to the proxy:
   - `mode`: `allow` or `block`.
   - `list`: List of tool names.
-  - `mode: "allow"` exposes only the listed tools, so an empty (or omitted) `list`
-    exposes **no** tools. `mode: "block"` hides the listed tools, so an empty list
-    hides nothing. The filter applies to tools only — a downstream's resources and
-    prompts are always exposed.
-- `Disabled` (bool): Enable or disable this server. Disabled servers are skipped at startup.
+  - `mode: "allow"` exposes only the listed tools and requires a non-empty `list`.
+    `mode: "block"` hides the listed tools. The filter applies to tools only;
+    use `resourceFilter` and `promptFilter` for the rest of the catalog.
+- `resourceFilter` (object): Selectively expose resources and resource templates.
+  Same shape as `toolFilter` (`mode` and `list`). A list entry matches a resource by
+  its `uri` or `name`, and a resource template by its `uriTemplate` or `name`.
+  In `block` mode a read is also refused when it targets a hidden resource (listed by
+  URI, or hidden by name once the resource list has been fetched) through an exposed
+  template that matches it. Blocking a template hides only that template: a URI it
+  would produce stays readable through another exposed template that matches it. The check
+  compares normalized URIs (fragment dropped, scheme and host lower-cased,
+  percent-encoded unreserved characters decoded), but a downstream that maps other
+  spellings to the same resource can still serve it; use `allow` mode when the filter
+  is a security boundary. In `allow` mode, allowing a template allows every URI it
+  matches, including resources that are not allowed individually.
+- `promptFilter` (object): Selectively expose prompts by name. Same shape as
+  `toolFilter`.
+- `disabled` (bool): Enable or disable this server. Disabled servers are skipped at startup.
 - `autoReconnect` (bool, default `false`): Keep a downstream connection alive across
   failures. When true, a server that is unreachable at startup is retried every
   `reconnectInterval` until it connects (its route is mounted then), and a connection
@@ -206,13 +232,23 @@ fallback, so an existing registration keeps working.)
   not by `reconnectInterval`. With the defaults (30s probe, three failures) a dropped
   connection recovers in roughly 90s plus connect time; shorten `pingInterval` to recover
   faster.
+  One kind of drop does not wait for the threshold: a `streamable-http` downstream that
+  restarts forgets the session the proxy holds, and that is final - no later probe can
+  succeed on it. With `autoReconnect` the connection is rebuilt as soon as the lost session
+  is noticed, by the keepalive probe or by a forwarded request; such a request is then
+  retried once on the new connection, which is safe because the server refused it before
+  any handler ran. Without `autoReconnect` the client is reported unhealthy right away and
+  stays unhealthy until the proxy is restarted.
 
 Notes:
 
 - `mcpProxy.options.authTokens` serves as the default token set if a server omits `options.authTokens`.
-- `mcpProxy.options.toolFilter` likewise serves as the default filter if a server omits
-  `options.toolFilter`. The other `mcpProxy.options` values (`panicIfInvalid`, `logEnabled`,
+- `mcpProxy.options.toolFilter`, `resourceFilter` and `promptFilter` likewise serve as the
+  default filters if a server omits them; a per-server filter replaces the inherited one
+  entirely. The other `mcpProxy.options` values (`panicIfInvalid`, `logEnabled`,
   `pingInterval`, `autoReconnect`, `reconnectInterval`) are defaults for servers that omit
-  them, so a fleet-wide setting can be declared once. `disabled` is per-server only and is
-  not inherited.
-- To discover tool names for filtering, start without a filter and check logs for lines like `<server> Adding tool <name>`.
+  them, so a fleet-wide setting can be declared once. `disabled` is per-server only;
+  setting it on `mcpProxy.options` is rejected.
+- To discover tool names for filtering, start without a filter and check logs for lines
+  like `<server> Adding tool <name>`. Resources, templates and prompts are logged the
+  same way (`Adding resource`, `Adding resource template`, `Adding prompt`) at debug level.
