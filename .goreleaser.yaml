@@ -29,7 +29,8 @@ builds:
       - goos: windows
         goarch: arm64
 changelog:
-  disable: false
+  # Release Please writes the notes on the draft before GoReleaser runs.
+  disable: true
   use: github
   sort: asc
   groups:
