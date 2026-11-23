@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.0.1](https://github.com/dkarter/mcp-proxy/compare/v2.0.0...v2.0.1) (2026-11-23)
+
+
+### Bug Fixes
+
+* **ci:** let Release Please own release notes ([#2](https://github.com/dkarter/mcp-proxy/issues/2)) ([1ebfecd](https://github.com/dkarter/mcp-proxy/commit/1ebfecd3af66ac560d73139ca3bbf5344a9aa16a))
+
 ## [2.0.0](https://github.com/dkarter/mcp-proxy/compare/v1.1.4...v2.0.0) (2026-11-23)
 
 
