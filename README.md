@@ -10,6 +10,17 @@ archives retain the upstream `mcp-proxy` executable name.
 
 Releases from v1.1.4 are immutable and include SHA-256 checksums signed with
 keyless Cosign and GitHub build-provenance attestations for each archive.
+Release Please opens a version and changelog PR from Conventional Commits.
+The repository must allow GitHub Actions to create pull requests and have
+immutable releases enabled.
+Merging it into `master` builds, signs, and attests the archives before
+publishing the draft. If a run leaves a draft behind, run the **Release**
+workflow on that release tag to resume publishing:
+
+```sh
+gh workflow run goreleaser.yml --ref vX.Y.Z
+```
+
 For v1.1.4, download your archive,
 `checksums.txt`, and `checksums.txt.sigstore.json` from
 <https://github.com/dkarter/mcp-proxy/releases/tag/v1.1.4>, then verify:
@@ -26,6 +37,9 @@ gh attestation verify mcp-proxy_1.1.4_darwin_arm64.tar.gz --repo dkarter/mcp-pro
 # Check the archive against the verified checksum file (GNU coreutils).
 sha256sum --check --ignore-missing checksums.txt
 ```
+
+For newer releases, substitute the release tag in the Cosign certificate
+identity.
 
 Existing downstream OAuth credentials without issuer metadata may require a
 one-time reauthorization after this upgrade. Do not disable issuer validation.

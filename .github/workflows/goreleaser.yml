@@ -1,10 +1,14 @@
-name: GoReleaser
+name: Release
 
 on:
   workflow_dispatch:
+    inputs:
+      expected-sha:
+        description: 'Release Please commit SHA (optional for manual reruns on a release tag)'
+        type: string
   push:
-    tags:
-      - "v*"
+    branches:
+      - master
 
 permissions:
   contents: read
@@ -13,29 +17,79 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
+  release-please:
+    if: github.repository == 'dkarter/mcp-proxy' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Create a draft for a merged release PR
+        id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          skip-github-pull-request: true
+      - name: Start the build on the release tag
+        if: steps.release.outputs.release_created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag_name }}
+          EXPECTED_SHA: ${{ steps.release.outputs.sha }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$EXPECTED_SHA" =~ ^[[:xdigit:]]{40}$ ]]
+          # GITHUB_TOKEN suppresses tag-push runs, but not explicit dispatches.
+          gh workflow run goreleaser.yml --repo "$GITHUB_REPOSITORY" \
+            --ref "$RELEASE_TAG" --field "expected-sha=$EXPECTED_SHA"
+      - name: Open or update the release PR
+        if: steps.release.outputs.release_created != 'true'
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          skip-github-release: true
+
   goreleaser:
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Run on the tag so the signature and provenance identify the built source.
+    if: >-
+      github.repository == 'dkarter/mcp-proxy' &&
+      github.event_name == 'workflow_dispatch' && github.ref_type == 'tag'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: write
       id-token: write
       attestations: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
     steps:
+      - name: Check that the release is still a draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft \
+            | jq -e '.isDraft == true'
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Reject duplicate release attempts
-        run: |
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo '::error::A release already exists for this tag. Use a new signed tag.'
-            exit 1
-          fi
+      - name: Verify the build commit
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXPECTED_SHA: ${{ inputs.expected-sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git merge-base --is-ancestor HEAD origin/master
+          if [[ -n "$EXPECTED_SHA" ]]; then
+            test "$GITHUB_SHA" = "$EXPECTED_SHA"
+          fi
       - name: Set up Go
         uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
@@ -49,24 +103,42 @@ jobs:
         run: go install github.com/sigstore/cosign/v3/cmd/cosign@v3.1.4
         env:
           GOTOOLCHAIN: auto
-      - name: Run GoReleaser
+      - name: Build archives and sign checksums
         uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
         with:
           distribution: goreleaser
           version: v2.19.0
-          args: release --clean
+          args: release --clean --skip=publish
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GORELEASER_CURRENT_TAG: ${{ env.RELEASE_TAG }}
       - name: Attest release archives
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-checksums: ./dist/checksums.txt
-      - name: Verify signature and publish release
+      - name: Verify, upload and publish release
         run: |
           cosign verify-blob \
-            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/goreleaser.yml@${GITHUB_REF}" \
+            --certificate-identity "https://github.com/${GITHUB_WORKFLOW_REF}" \
             --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
             --bundle dist/checksums.txt.sigstore.json dist/checksums.txt
-          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
+          (
+            cd dist
+            sha256sum --strict --check checksums.txt
+          )
+          gh release view "$RELEASE_TAG" --json isDraft | jq -e '.isDraft == true'
+          remote_sha="$(git ls-remote --exit-code origin "$GITHUB_REF" "$GITHUB_REF^{}" | tail -n 1 | cut -f 1)"
+          test "$remote_sha" = "$GITHUB_SHA"
+          archives=()
+          while read -r digest file; do
+            [[ "$digest" =~ ^[[:xdigit:]]{64}$ ]]
+            [[ "$file" =~ ^mcp-proxy_[0-9]+\.[0-9]+\.[0-9]+_[a-z0-9_]+\.(tar\.gz|zip)$ ]]
+            archives+=("dist/$file")
+          done < dist/checksums.txt
+          test "${#archives[@]}" -gt 0
+          gh release upload "$RELEASE_TAG" --clobber "${archives[@]}" \
+            dist/checksums.txt dist/checksums.txt.sigstore.json
+          gh release edit "$RELEASE_TAG" --draft=false
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
+            | jq -e '.immutable == true and .draft == false'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
